@@ -1,0 +1,90 @@
+                         ┌───────────────────┐
+                         │      USER          │
+                         │   Akshar Bharati   │
+                         └─────────┬─────────┘
+                                   │
+                                   ▼
+                    ┌──────────────────────────┐
+                    │       CSR WEBSITE        │
+                    │                          │
+                    │  🔍 Search Company       │
+                    │                          │
+                    │  "Tata Motors"            │
+                    └────────────┬─────────────┘
+                                 │
+                                 ▼
+                    ┌──────────────────────────┐
+                    │    SEARCH DATABASE       │
+                    │                          │
+                    │  Is Tata Motors already  │
+                    │  in our database?        │
+                    └────────────┬─────────────┘
+                                 │
+                    ┌────────────┴────────────┐
+                    │                         │
+                  YES                        NO
+                    │                         │
+                    ▼                         ▼
+          ┌─────────────────┐       ┌────────────────────┐
+          │ Show existing   │       │ Start automated    │
+          │ company profile │       │ research           │
+          └────────┬────────┘       └─────────┬──────────┘
+                   │                          │
+                   │                          ▼
+                   │               ┌────────────────────┐
+                   │               │ Find public        │
+                   │               │ company sources   │
+                   │               └─────────┬──────────┘
+                   │                         │
+                   │                         ▼
+                   │               ┌────────────────────┐
+                   │               │ Find Annual / CSR │
+                   │               │ / BRSR reports    │
+                   │               └─────────┬──────────┘
+                   │                         │
+                   │                         ▼
+                   │               ┌────────────────────┐
+                   │               │ Download / read    │
+                   │               │ relevant documents │
+                   │               └─────────┬──────────┘
+                   │                         │
+                   │                         ▼
+                   │               ┌────────────────────┐
+                   │               │ AI extracts        │
+                   │               │ relevant CSR data  │
+                   │               └─────────┬──────────┘
+                   │                         │
+                   │                         ▼
+                   │               ┌────────────────────┐
+                   │               │ Validate + format  │
+                   │               │ extracted data     │
+                   │               └─────────┬──────────┘
+                   │                         │
+                   │                         ▼
+                   │               ┌────────────────────┐
+                   │               │ Save to database   │
+                   │               └─────────┬──────────┘
+                   │                         │
+                   └────────────┬────────────┘
+                                ▼
+                   ┌──────────────────────────┐
+                   │    COMPANY PROFILE       │
+                   │                          │
+                   │ Tata Motors              │
+                   │ Industry                  │
+                   │ Location                  │
+                   │ CSR spending              │
+                   │ CSR focus areas           │
+                   │ Foundation                 │
+                   │ Contact information       │
+                   │ Reports                   │
+                   │ Sources                   │
+                   └────────────┬─────────────┘
+                                │
+                                ▼
+                   ┌──────────────────────────┐
+                   │       NGO USER            │
+                   │                          │
+                   │ Can view / filter / use  │
+                   │ the CSR information       │
+                   └──────────────────────────┘
