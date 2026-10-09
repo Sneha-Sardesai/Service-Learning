@@ -10,5 +10,11 @@ __pycache__/
 *.pyo
 *.pyd
 *.log
+research/downloads/
+research/documents/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.codex-test-deps/
 .DS_Store
 Thumbs.db
