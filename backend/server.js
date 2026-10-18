@@ -1,6 +1,7 @@
 'use strict';
 
 const path = require('path');
+const fs = require('fs');
 require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
 const express = require('express');
 const crypto = require('crypto');
@@ -47,6 +48,12 @@ function companyInput(body, existing = {}) {
   const websiteInput = body.official_website === undefined
     ? existing.official_website
     : body.official_website;
+  const website = websiteInput ? normalizeWebsite(websiteInput) : null;
+  if (website && website !== existing.official_website && body.confirm_official_website !== true) {
+    const error = new Error("Confirm that this is the company's official website before saving it.");
+    error.status = 400;
+    throw error;
+  }
   if (industry !== null && industry !== undefined && (typeof industry !== 'string' || industry.length > 160)) {
     const error = new Error('Industry must be a text value of 160 characters or fewer.');
     error.status = 400;
@@ -62,7 +69,7 @@ function companyInput(body, existing = {}) {
     normalizedName: normalizeCompanyName(name),
     industry: typeof industry === 'string' ? industry.trim() || null : null,
     notes: typeof notes === 'string' ? notes.trim() || null : null,
-    website: websiteInput ? normalizeWebsite(websiteInput) : null,
+    website,
   };
 }
 
@@ -86,14 +93,18 @@ app.get('/api/health', async (_request, response) => {
   }
   try {
     await query('SELECT 1 FROM companies LIMIT 0');
+    await query('SELECT warning_summary FROM research_runs LIMIT 0');
+    await query('SELECT original_value FROM findings LIMIT 0');
+    await query('SELECT 1 FROM research_run_documents LIMIT 0');
+    await query('SELECT 1 FROM research_run_findings LIMIT 0');
     response.json({ status: 'ok', database: 'available' });
   } catch (error) {
     console.error(`Database health check failed: ${error.message}`);
-    if (error.code === 'ER_NO_SUCH_TABLE' || error.code === 'ER_BAD_DB_ERROR') {
+    if (['ER_NO_SUCH_TABLE', 'ER_BAD_DB_ERROR', 'ER_BAD_FIELD_ERROR'].includes(error.code)) {
       return response.status(503).json({
         status: 'degraded',
         database: 'schema_missing',
-        message: 'The MySQL schema is not initialized. Run database/schema.sql from the project root.',
+        message: 'The database schema is incomplete. For a new database run database/schema.sql; for an existing database apply the database/migrations files in numeric order once.',
       });
     }
     response.status(503).json({
@@ -111,7 +122,10 @@ app.get('/api/dashboard', async (_request, response) => {
        (SELECT COUNT(*) FROM companies WHERE research_status IN ('completed', 'partially_completed')) AS researched_companies,
        (SELECT COUNT(*) FROM companies WHERE research_status IN ('not_started', 'queued', 'running', 'failed')) AS pending_companies,
        (SELECT COUNT(*) FROM documents) AS documents_discovered,
-       (SELECT COUNT(*) FROM findings WHERE review_status = 'pending_review') AS findings_awaiting_review`,
+       (SELECT COUNT(*) FROM findings WHERE review_status = 'pending_review') AS findings_awaiting_review,
+       (SELECT COUNT(*) FROM research_runs WHERE status = 'completed') AS completed_runs,
+       (SELECT COUNT(*) FROM research_runs WHERE status = 'partially_completed') AS partially_completed_runs,
+       (SELECT COUNT(*) FROM research_runs WHERE status = 'failed') AS failed_runs`,
   );
   const recentRuns = await query(
     `SELECT r.id, r.company_id, c.company_name, r.status, r.progress_message,
@@ -169,6 +183,22 @@ app.get('/api/companies', async (request, response) => {
   });
 });
 
+app.get('/api/company-domain-suggestions', async (request, response) => {
+  const companyName = validateCompanyName(request.query.company_name);
+  const registryPath = path.join(__dirname, '..', 'research', 'company_domains.json');
+  const registry = JSON.parse(fs.readFileSync(registryPath, 'utf8'));
+  const normalizedName = normalizeCompanyName(companyName);
+  const match = Object.entries(registry).find(([name, details]) => (
+    details && typeof details === 'object'
+      && [name, ...(Array.isArray(details.aliases) ? details.aliases : [])]
+        .some((candidate) => normalizeCompanyName(candidate) === normalizedName)
+  ));
+  response.json({
+    suggested_website: match ? normalizeWebsite(match[1].website) : null,
+    requires_confirmation: Boolean(match),
+  });
+});
+
 app.post('/api/companies', async (request, response) => {
   const input = companyInput(request.body || {});
   try {
@@ -204,6 +234,7 @@ app.get('/api/companies/:id', async (request, response) => {
     ),
     query(
       `SELECT id, research_run_id, document_id, field_name, finding_value, financial_year,
+         COALESCE(original_value, finding_value) AS original_value,
          source_url, page_number, supporting_excerpt, extraction_method, review_status,
          reviewer_notes, reviewed_at, created_at, updated_at
        FROM findings WHERE company_id = ? ORDER BY financial_year DESC, created_at DESC LIMIT 500`,
@@ -240,6 +271,9 @@ app.delete('/api/companies/:id', async (request, response) => {
 });
 
 app.post('/api/companies/:id/research', async (request, response) => {
+  if (request.body?.confirm_official_website !== true) {
+    return response.status(400).json({ error: "Confirm the company's official website before starting research." });
+  }
   const companyId = parseId(request.params.id);
   const company = await getCompany(companyId);
   const run = await createRun(companyId);
@@ -251,6 +285,9 @@ app.post('/api/companies/:id/research', async (request, response) => {
 });
 
 app.post('/api/research', async (request, response) => {
+  if (request.body?.confirm_official_website !== true) {
+    return response.status(400).json({ error: "Confirm the company's official website before starting research." });
+  }
   const companyName = validateCompanyName(request.body?.companyName);
   const website = request.body?.website === undefined
     ? ''
@@ -276,15 +313,80 @@ app.post('/api/research', async (request, response) => {
   });
 });
 
+app.get('/api/research', async (request, response) => {
+  const page = Number(request.query.page || 1);
+  const limit = Number(request.query.limit || 20);
+  if (!Number.isInteger(page) || page < 1 || page > 100000) {
+    return response.status(400).json({ error: 'page must be a positive whole number.' });
+  }
+  if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+    return response.status(400).json({ error: 'limit must be a whole number between 1 and 100.' });
+  }
+  const totalRows = await query('SELECT COUNT(*) AS total FROM research_runs');
+  const researchRuns = await query(
+    `SELECT r.id, r.company_id, c.company_name, c.official_website, r.status,
+       r.progress_message, r.pages_visited, r.documents_discovered, r.documents_processed,
+       r.findings_count, r.error_summary, r.warning_summary, r.created_at, r.started_at, r.completed_at,
+       (SELECT COUNT(*) FROM research_run_documents rd WHERE rd.research_run_id = r.id) AS saved_documents,
+       (SELECT COUNT(*) FROM research_run_findings rf
+          JOIN findings f ON f.id = rf.finding_id
+          WHERE rf.research_run_id = r.id AND f.review_status = 'pending_review') AS pending_findings,
+       (SELECT COUNT(*) FROM research_run_findings rf
+          JOIN findings f ON f.id = rf.finding_id
+          WHERE rf.research_run_id = r.id AND f.review_status = 'approved') AS approved_findings,
+       (SELECT COUNT(*) FROM research_run_findings rf
+          JOIN findings f ON f.id = rf.finding_id
+          WHERE rf.research_run_id = r.id AND f.review_status = 'rejected') AS rejected_findings
+     FROM research_runs r
+     JOIN companies c ON c.id = r.company_id
+     ORDER BY r.created_at DESC
+     LIMIT ? OFFSET ?`,
+    [limit, (page - 1) * limit],
+  );
+  const total = Number(totalRows[0].total) || 0;
+  response.json({
+    research_runs: researchRuns,
+    pagination: { page, limit, total, total_pages: Math.max(1, Math.ceil(total / limit)) },
+  });
+});
+
 app.get('/api/research/:id', async (request, response) => {
   const id = parseId(request.params.id);
   const rows = await query(
-    `SELECT r.*, c.company_name FROM research_runs r
+    `SELECT r.*, c.company_name, c.industry, c.official_website, c.notes
+     FROM research_runs r
      JOIN companies c ON c.id = r.company_id WHERE r.id = ?`,
     [id],
   );
   if (!rows.length) return response.status(404).json({ error: 'Research run not found.' });
-  response.json({ research_run: rows[0] });
+  const [documents, findings] = await Promise.all([
+    query(
+      `SELECT d.id, d.source_url, d.title, d.file_type, d.content_hash, d.storage_name,
+         d.processing_status, d.processing_error, d.downloaded_at, d.created_at
+       FROM research_run_documents rd
+       JOIN documents d ON d.id = rd.document_id
+       WHERE rd.research_run_id = ? ORDER BY d.title`,
+      [id],
+    ),
+    query(
+      `SELECT f.id, f.research_run_id, f.document_id, f.field_name, f.finding_value,
+         COALESCE(f.original_value, f.finding_value) AS original_value, f.financial_year,
+         f.source_url, f.page_number, f.supporting_excerpt, f.extraction_method,
+         f.review_status, f.reviewer_notes, f.reviewed_at, f.created_at, f.updated_at
+       FROM research_run_findings rf
+       JOIN findings f ON f.id = rf.finding_id
+       WHERE rf.research_run_id = ?
+       ORDER BY f.financial_year DESC, f.field_name, f.created_at`,
+      [id],
+    ),
+  ]);
+  response.json({ research_run: rows[0], company: {
+    id: rows[0].company_id,
+    company_name: rows[0].company_name,
+    industry: rows[0].industry,
+    official_website: rows[0].official_website,
+    notes: rows[0].notes,
+  }, documents, findings });
 });
 
 app.get('/api/research/:id/documents', async (request, response) => {
@@ -292,8 +394,11 @@ app.get('/api/research/:id/documents', async (request, response) => {
   const runs = await query('SELECT id FROM research_runs WHERE id = ?', [id]);
   if (!runs.length) return response.status(404).json({ error: 'Research run not found.' });
   const rows = await query(
-    `SELECT id, source_url, title, file_type, processing_status, processing_error,
-       downloaded_at, created_at FROM documents WHERE research_run_id = ? ORDER BY title`,
+    `SELECT d.id, d.source_url, d.title, d.file_type, d.processing_status, d.processing_error,
+       d.downloaded_at, d.created_at
+     FROM research_run_documents rd
+     JOIN documents d ON d.id = rd.document_id
+     WHERE rd.research_run_id = ? ORDER BY d.title`,
     [id],
   );
   response.json({ documents: rows });
@@ -315,7 +420,8 @@ app.get('/api/companies/:id/findings', async (request, response) => {
   const companyId = parseId(request.params.id);
   await getCompany(companyId);
   const findings = await query(
-    `SELECT id, research_run_id, document_id, field_name, finding_value, financial_year,
+    `SELECT id, research_run_id, document_id, field_name, finding_value,
+       COALESCE(original_value, finding_value) AS original_value, financial_year,
        source_url, page_number, supporting_excerpt, extraction_method, review_status,
        reviewer_notes, reviewed_at, created_at, updated_at
      FROM findings WHERE company_id = ? ORDER BY financial_year DESC, created_at DESC`,
@@ -340,16 +446,22 @@ app.post('/api/companies/:id/findings', async (request, response) => {
     .digest('hex');
   await query(
     `INSERT IGNORE INTO findings
-      (company_id, research_run_id, field_name, finding_value, source_url,
+      (company_id, research_run_id, field_name, finding_value, original_value, source_url,
        supporting_excerpt, extraction_method, review_status, evidence_hash)
      SELECT ?, (SELECT id FROM research_runs WHERE company_id = ? ORDER BY created_at DESC LIMIT 1),
-       ?, ?, '', ?, 'manual', 'unavailable', ?`,
-    [companyId, companyId, fieldName, value, excerpt, digest],
+       ?, ?, ?, '', ?, 'manual', 'unavailable', ?`,
+    [companyId, companyId, fieldName, value, value, excerpt, digest],
   );
   const rows = await query(
     'SELECT * FROM findings WHERE company_id = ? AND evidence_hash = ?',
     [companyId, digest],
   );
+  if (rows[0]?.research_run_id) {
+    await query(
+      'INSERT IGNORE INTO research_run_findings (research_run_id, finding_id) VALUES (?, ?)',
+      [rows[0].research_run_id, rows[0].id],
+    );
+  }
   response.status(201).json({ finding: rows[0] });
 });
 
@@ -415,7 +527,7 @@ app.use((error, _request, response, _next) => {
 });
 
 if (require.main === module) {
-  const server = app.listen(port, () => {
+  const server = app.listen(port, '127.0.0.1', () => {
     console.log(`CSR research API listening on http://localhost:${port}`);
     if (isDatabaseConfigured()) {
       void recoverInterruptedRuns().catch((error) => {

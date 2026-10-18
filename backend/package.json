@@ -6,7 +6,6 @@
   "scripts": {
     "start": "node server.js",
     "devstart": "node --watch server.js",
-    "cli": "node cli.js",
     "test": "node --test"
   },
   "keywords": [],

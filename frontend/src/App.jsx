@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { api } from './api';
 import './index.css';
 
@@ -34,6 +34,54 @@ function formatDate(value) {
   return Number.isNaN(date.getTime()) ? '—' : date.toLocaleDateString();
 }
 
+function csvCell(value) {
+  let text = value == null ? '' : String(value);
+  if (/^[\t\r ]*[=+\-@]/.test(text)) text = `'${text}`;
+  return `"${text.replaceAll('"', '""')}"`;
+}
+
+function downloadCsv(filename, rows) {
+  const csv = rows.map((row) => row.map(csvCell).join(',')).join('\r\n');
+  const url = URL.createObjectURL(new Blob([`\uFEFF${csv}`], { type: 'text/csv;charset=utf-8' }));
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
+function downloadHistoryCsv(runs) {
+  const columns = ['Run ID', 'Company', 'Status', 'Started', 'Completed', 'Pages visited', 'Documents discovered', 'Documents processed', 'Findings', 'Progress', 'Warnings', 'Errors'];
+  downloadCsv('research-run-history.csv', [
+    columns,
+    ...runs.map((run) => [
+      run.id, run.company_name, run.status, run.created_at, run.completed_at,
+      run.pages_visited, run.documents_discovered, run.documents_processed,
+      run.findings_count, run.progress_message, run.warning_summary, run.error_summary,
+    ]),
+  ]);
+}
+
+function downloadRunCsv(detail) {
+  const { research_run: run, company, documents = [], findings = [] } = detail;
+  const rows = [
+    ['Record type', 'Run ID', 'Company', 'Official website', 'Run status', 'Started', 'Completed', 'Field / title', 'Reviewed value / source URL', 'Original extracted value', 'Financial year', 'Review status', 'Reviewer notes', 'Evidence excerpt', 'Processing status', 'Processing error'],
+    ['Run', run.id, company?.company_name, company?.official_website, run.status, run.created_at, run.completed_at, '', '', '', '', '', '', '', '', ''],
+    ...findings.map((finding) => [
+      'Finding', run.id, company?.company_name, company?.official_website, run.status, run.created_at, run.completed_at,
+      finding.field_name, finding.finding_value, finding.original_value, finding.financial_year,
+      finding.review_status, finding.reviewer_notes, finding.supporting_excerpt, '', '',
+    ]),
+    ...documents.map((item) => [
+      'Document', run.id, company?.company_name, company?.official_website, run.status, run.created_at, run.completed_at,
+      item.title, item.source_url, '', '', '', '', '', item.processing_status, item.processing_error,
+    ]),
+  ];
+  downloadCsv(`research-run-${run.id}-report.csv`, rows);
+}
+
 function Status({ value }) {
   return <span className={`status status-${value || 'not_started'}`}>{statusLabels[value] || value || 'Unknown'}</span>;
 }
@@ -56,10 +104,29 @@ function App() {
   const [companyPages, setCompanyPages] = useState(1);
   const [companyDialog, setCompanyDialog] = useState(null);
   const [companyForm, setCompanyForm] = useState(emptyCompany);
+  const [websiteConfirmed, setWebsiteConfirmed] = useState(false);
+  const [domainSuggestion, setDomainSuggestion] = useState(null);
+  const [suggestionLoading, setSuggestionLoading] = useState(false);
+  const [suggestionError, setSuggestionError] = useState('');
+  const [researchDialog, setResearchDialog] = useState(null);
+  const [researchConfirmed, setResearchConfirmed] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [researching, setResearching] = useState(false);
   const [document, setDocument] = useState(null);
   const [findingEdits, setFindingEdits] = useState({});
+  const [savingFinding, setSavingFinding] = useState({});
+  const [markingUnavailable, setMarkingUnavailable] = useState(false);
   const [unavailableField, setUnavailableField] = useState('');
+  const [researchRuns, setResearchRuns] = useState([]);
+  const [researchPagination, setResearchPagination] = useState({});
+  const [researchPage, setResearchPage] = useState(1);
+  const [researchLoading, setResearchLoading] = useState(false);
+  const [researchError, setResearchError] = useState('');
+  const [exportingHistory, setExportingHistory] = useState(false);
+  const [runDetail, setRunDetail] = useState(null);
+  const [runDetailLoading, setRunDetailLoading] = useState(false);
+  const [runDetailError, setRunDetailError] = useState('');
+  const submissions = useRef(new Set());
 
   async function loadDashboard() {
     const data = await api('/dashboard');
@@ -81,6 +148,61 @@ function App() {
   async function loadProfile(id) {
     const data = await api(`/companies/${id}`);
     setProfile(data);
+  }
+
+  async function loadResearchHistory(nextPage = researchPage) {
+    if (submissions.current.has('history-load')) return;
+    submissions.current.add('history-load');
+    setResearchLoading(true);
+    setResearchError('');
+    try {
+      const data = await api(`/research?page=${nextPage}&limit=20`);
+      setResearchRuns(data.research_runs || []);
+      setResearchPagination(data.pagination || {});
+      setResearchPage(nextPage);
+    } catch (requestError) {
+      setResearchError(requestError.message);
+    } finally {
+      setResearchLoading(false);
+      submissions.current.delete('history-load');
+    }
+  }
+
+  async function exportAllResearchHistory() {
+    if (submissions.current.has('history-export')) return;
+    submissions.current.add('history-export');
+    setExportingHistory(true);
+    setResearchError('');
+    try {
+      const first = await api('/research?page=1&limit=20');
+      const allRuns = first.research_runs || [];
+      const totalPages = first.pagination?.total_pages || 1;
+      for (let pageNumber = 2; pageNumber <= totalPages; pageNumber += 1) {
+        const next = await api(`/research?page=${pageNumber}&limit=20`);
+        allRuns.push(...(next.research_runs || []));
+      }
+      downloadHistoryCsv(allRuns);
+    } catch (requestError) {
+      setResearchError(requestError.message);
+    } finally {
+      setExportingHistory(false);
+      submissions.current.delete('history-export');
+    }
+  }
+
+  async function openRunDetail(id) {
+    setRunDetail(null);
+    setRunDetailError('');
+    setRunDetailLoading(true);
+    setPage('researchDetail');
+    try {
+      const data = await api(`/research/${id}`);
+      setRunDetail(data);
+    } catch (requestError) {
+      setRunDetailError(requestError.message);
+    } finally {
+      setRunDetailLoading(false);
+    }
   }
 
   async function refreshHome() {
@@ -106,11 +228,60 @@ function App() {
   }, []);
 
   useEffect(() => {
+    const companyName = companyForm.company_name.trim();
+    if (!companyDialog || !companyName) {
+      setDomainSuggestion(null);
+      setSuggestionError('');
+      setSuggestionLoading(false);
+      return undefined;
+    }
+
+    let active = true;
+    setDomainSuggestion(null);
+    setSuggestionError('');
+    setSuggestionLoading(true);
+    const timer = window.setTimeout(async () => {
+      try {
+        const params = new URLSearchParams({ company_name: companyName });
+        const data = await api(`/company-domain-suggestions?${params}`);
+        if (active) {
+          setDomainSuggestion(typeof data.suggested_website === 'string' && data.suggested_website.trim()
+            ? data.suggested_website
+            : null);
+        }
+      } catch {
+        if (active) {
+          setDomainSuggestion(null);
+          setSuggestionError('Domain suggestions are temporarily unavailable.');
+        }
+      } finally {
+        if (active) setSuggestionLoading(false);
+      }
+    }, 300);
+
+    return () => {
+      active = false;
+      window.clearTimeout(timer);
+    };
+  }, [companyDialog?.mode, companyForm.company_name]);
+
+  useEffect(() => {
     const timer = setTimeout(() => {
       if (page === 'companies') loadCompanies().catch((requestError) => setError(requestError.message));
     }, 200);
     return () => clearTimeout(timer);
   }, [search, industryFilter, statusFilter, companyPage, page]);
+
+  useEffect(() => {
+    if (page === 'research') void loadResearchHistory(researchPage);
+  }, [page]);
+
+  const hasActiveHistoryRuns = researchRuns.some((run) => ['queued', 'running'].includes(run.status));
+  useEffect(() => {
+    if (page !== 'research' || !hasActiveHistoryRuns) return undefined;
+    const timer = window.setInterval(() => void loadResearchHistory(researchPage), 2000);
+    return () => window.clearInterval(timer);
+  }, [page, hasActiveHistoryRuns, researchPage]);
 
   const profileRunState = profile?.research_runs
     ?.map((run) => `${run.id}:${run.status}`)
@@ -146,6 +317,7 @@ function App() {
 
   function openNewCompany() {
     setCompanyForm(emptyCompany);
+    setWebsiteConfirmed(false);
     setCompanyDialog({ mode: 'create' });
   }
 
@@ -156,18 +328,31 @@ function App() {
       official_website: company.official_website || '',
       notes: company.notes || '',
     });
+    setWebsiteConfirmed(false);
     setCompanyDialog({ mode: 'edit', company });
   }
 
   async function saveCompany(event) {
     event.preventDefault();
+    if (submissions.current.has('company')) return;
+    const websiteChanged = companyDialog.mode === 'create'
+      ? Boolean(companyForm.official_website.trim())
+      : companyForm.official_website.trim() !== (companyDialog.company.official_website || '').trim();
+    if (websiteChanged && companyForm.official_website.trim() && !websiteConfirmed) {
+      setError('Confirm that this is the company’s official website before saving it.');
+      return;
+    }
+    submissions.current.add('company');
     setSaving(true);
     setError('');
     try {
       const isEdit = companyDialog.mode === 'edit';
       await api(isEdit ? `/companies/${companyDialog.company.id}` : '/companies', {
         method: isEdit ? 'PATCH' : 'POST',
-        body: JSON.stringify(companyForm),
+        body: JSON.stringify({
+          ...companyForm,
+          confirm_official_website: websiteConfirmed,
+        }),
       });
       setCompanyDialog(null);
       setNotice(isEdit ? 'Company details updated.' : 'Company added to the directory.');
@@ -177,6 +362,7 @@ function App() {
       setError(requestError.message);
     } finally {
       setSaving(false);
+      submissions.current.delete('company');
     }
   }
 
@@ -227,15 +413,33 @@ function App() {
       openEditCompany(company);
       return;
     }
+    setResearchConfirmed(false);
+    setResearchDialog(company);
+  }
+
+  async function confirmResearch() {
+    const company = researchDialog;
+    if (!company || !researchConfirmed || submissions.current.has(`research-${company.id}`)) return;
+    submissions.current.add(`research-${company.id}`);
+    setResearching(true);
+    setError('');
     try {
-      const response = await api(`/companies/${company.id}/research`, { method: 'POST' });
+      const response = await api(`/companies/${company.id}/research`, {
+        method: 'POST',
+        body: JSON.stringify({ confirm_official_website: true }),
+      });
       setNotice(`Research run ${response.research_run.id} was queued.`);
       setPage('research');
+      setResearchPage(1);
       setSelectedCompany(company);
       await Promise.all([loadDashboard(), loadCompanies()]);
       await loadProfile(company.id);
     } catch (requestError) {
       setError(requestError.message);
+    } finally {
+      setResearching(false);
+      submissions.current.delete(`research-${company.id}`);
+      setResearchDialog(null);
     }
   }
 
@@ -249,6 +453,9 @@ function App() {
   }
 
   async function saveFinding(finding) {
+    if (submissions.current.has(`finding-${finding.id}`)) return;
+    submissions.current.add(`finding-${finding.id}`);
+    setSavingFinding((current) => ({ ...current, [finding.id]: true }));
     const edit = findingEdits[finding.id] || {};
     try {
       await api(`/findings/${finding.id}/review`, {
@@ -269,11 +476,16 @@ function App() {
       await Promise.all([loadProfile(profile.company.id), loadDashboard()]);
     } catch (requestError) {
       setError(requestError.message);
+    } finally {
+      submissions.current.delete(`finding-${finding.id}`);
+      setSavingFinding((current) => ({ ...current, [finding.id]: false }));
     }
   }
 
   async function markUnavailable() {
-    if (!unavailableField || !profile) return;
+    if (!unavailableField || !profile || submissions.current.has('mark-unavailable')) return;
+    submissions.current.add('mark-unavailable');
+    setMarkingUnavailable(true);
     try {
       await api(`/companies/${profile.company.id}/findings`, {
         method: 'POST',
@@ -284,6 +496,9 @@ function App() {
       await Promise.all([loadProfile(profile.company.id), loadDashboard()]);
     } catch (requestError) {
       setError(requestError.message);
+    } finally {
+      setMarkingUnavailable(false);
+      submissions.current.delete('mark-unavailable');
     }
   }
 
@@ -312,7 +527,7 @@ function App() {
           <button className={page === 'companies' || page === 'profile' ? 'nav-item active' : 'nav-item'} onClick={() => navigate('companies')}>
             <span>▦</span> Companies
           </button>
-          <button className={page === 'research' ? 'nav-item active' : 'nav-item'} onClick={() => navigate('research')}>
+          <button className={page === 'research' || page === 'researchDetail' ? 'nav-item active' : 'nav-item'} onClick={() => navigate('research')}>
             <span>◷</span> Research runs
           </button>
         </nav>
@@ -341,7 +556,7 @@ function App() {
           {dashboard && page === 'dashboard' && (
             <Dashboard dashboard={dashboard} onPage={navigate} onCompany={(run) => {
               void openProfileById(run.company_id);
-            }} />
+            }} onDetails={(run) => void openRunDetail(run.id)} />
           )}
 
           {dashboard && page === 'companies' && (
@@ -366,14 +581,28 @@ function App() {
             </section>
           )}
 
-          {dashboard && page === 'research' && (
+          {page === 'research' && (
             <section>
-              <div className="page-heading"><div><p className="eyebrow">ACTIVITY</p><h1>Research runs</h1><p className="muted">Live status for website discovery and document processing.</p></div><button className="button button-outline" onClick={() => void loadDashboard()}>Refresh status</button></div>
-              <ResearchRuns runs={dashboard.recent_runs || []} onCompany={(run) => {
+              <div className="page-heading"><div><p className="eyebrow">ACTIVITY</p><h1>Research runs</h1><p className="muted">Persisted run history and current document-processing status.</p></div><div className="page-actions"><button className="button button-outline" onClick={() => void exportAllResearchHistory()} disabled={exportingHistory}>{exportingHistory ? 'Preparing CSV…' : 'Export all CSV'}</button><button className="button button-outline" onClick={() => void loadResearchHistory(researchPage)} disabled={researchLoading}>{researchLoading ? 'Refreshing…' : 'Refresh history'}</button></div></div>
+              {researchError && <div className="alert alert-error" role="alert">{researchError}<button onClick={() => setResearchError('')} aria-label="Dismiss history error">×</button></div>}
+              {researchLoading && researchRuns.length === 0 ? <div className="loading-card">Loading saved research runs…</div> : null}
+              {!researchLoading && !researchError && researchRuns.length === 0 ? <div className="empty-state"><h2>No saved research runs</h2><p>Start a run from a company profile after confirming its official website.</p><button className="button button-outline" onClick={() => navigate('companies')}>Browse companies</button></div> : null}
+              {researchRuns.length > 0 && <ResearchRuns runs={researchRuns} onDetails={(run) => void openRunDetail(run.id)} onCompany={(run) => {
                 void openProfileById(run.company_id);
-              }} />
+              }} />}
+              {researchRuns.length > 0 && <div className="pagination"><span>Page {researchPagination.page || researchPage} of {researchPagination.total_pages || 1}{researchPagination.total != null ? ` · ${researchPagination.total} runs` : ''}</span><div><button className="button button-outline button-small" disabled={researchLoading || researchPage <= 1} onClick={() => void loadResearchHistory(researchPage - 1)}>Previous</button><button className="button button-outline button-small" disabled={researchLoading || researchPage >= (researchPagination.total_pages || 1)} onClick={() => void loadResearchHistory(researchPage + 1)}>Next</button></div></div>}
               <div className="callout"><strong>How this works</strong><p>The researcher stays on the confirmed company website, follows crawl limits, respects robots.txt, and records errors instead of guessing when a source cannot be reached.</p></div>
             </section>
+          )}
+
+          {page === 'researchDetail' && (
+            <ResearchRunDetail
+              detail={runDetail}
+              loading={runDetailLoading}
+              error={runDetailError}
+              onBack={() => navigate('research')}
+              onCompany={(id) => void openProfileById(id)}
+            />
           )}
 
           {dashboard && page === 'profile' && (
@@ -383,28 +612,48 @@ function App() {
               onEdit={() => profile && openEditCompany(profile.company)}
               onDelete={() => profile && deleteCompany(profile.company)}
               onResearch={() => profile && startResearch(profile.company)}
+              onRunDetails={(run) => void openRunDetail(run.id)}
               onDocument={showDocument}
               onSaveFinding={saveFinding}
+              savingFinding={savingFinding}
               findingEdits={findingEdits}
               setFindingEdits={setFindingEdits}
               unavailableField={unavailableField}
               setUnavailableField={setUnavailableField}
               onMarkUnavailable={markUnavailable}
+              markingUnavailable={markingUnavailable}
             />
           )}
         </div>
       </main>
 
       {companyDialog && (
-        <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setCompanyDialog(null); }}>
+        <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !saving) setCompanyDialog(null); }}>
           <form className="modal-card" onSubmit={saveCompany}>
-            <div className="modal-heading"><div><p className="eyebrow">{companyDialog.mode === 'edit' ? 'COMPANY DETAILS' : 'NEW RECORD'}</p><h2>{companyDialog.mode === 'edit' ? 'Edit company' : 'Add company'}</h2></div><button type="button" className="icon-button" onClick={() => setCompanyDialog(null)} aria-label="Close">×</button></div>
-            <label>Company name <span className="required">*</span><input autoFocus required maxLength="200" value={companyForm.company_name} onChange={(event) => setCompanyForm({ ...companyForm, company_name: event.target.value })} /></label>
+            <div className="modal-heading"><div><p className="eyebrow">{companyDialog.mode === 'edit' ? 'COMPANY DETAILS' : 'NEW RECORD'}</p><h2>{companyDialog.mode === 'edit' ? 'Edit company' : 'Add company'}</h2></div><button type="button" className="icon-button" disabled={saving} onClick={() => setCompanyDialog(null)} aria-label="Close">×</button></div>
+            <label>Company name <span className="required">*</span><input autoFocus required maxLength="200" value={companyForm.company_name} onChange={(event) => { setCompanyForm({ ...companyForm, company_name: event.target.value }); setWebsiteConfirmed(false); setDomainSuggestion(null); }} /></label>
             <label>Industry<input maxLength="160" value={companyForm.industry} onChange={(event) => setCompanyForm({ ...companyForm, industry: event.target.value })} placeholder="e.g. Automotive" /></label>
-            <label>Confirmed official website<input type="text" inputMode="url" value={companyForm.official_website} onChange={(event) => setCompanyForm({ ...companyForm, official_website: event.target.value })} placeholder="https://www.company.com" /><small>Enter the confirmed domain; the crawler will not guess one.</small></label>
+            <label>Confirmed official website<input type="text" inputMode="url" value={companyForm.official_website} onChange={(event) => { setCompanyForm({ ...companyForm, official_website: event.target.value }); setWebsiteConfirmed(false); }} placeholder="https://www.company.com" /><small>Enter the confirmed domain; the crawler will not guess one.</small></label>
+            {suggestionLoading && <p className="suggestion-note" role="status">Checking for a domain suggestion…</p>}
+            {!suggestionLoading && domainSuggestion && <div className="domain-suggestion"><div><strong>Registry suggestion</strong><span>{domainSuggestion}</span><small>Suggestion only. Verify the domain before saving or researching.</small></div><button type="button" className="button button-outline button-small" onClick={() => { setCompanyForm((current) => ({ ...current, official_website: domainSuggestion })); setWebsiteConfirmed(false); }}>Use suggestion</button></div>}
+            {!suggestionLoading && suggestionError && <p className="suggestion-note" role="status">{suggestionError}</p>}
+            {!suggestionLoading && !suggestionError && !domainSuggestion && companyDialog && companyForm.company_name.trim() && <p className="suggestion-note">No domain suggestion was returned for this name.</p>}
+            {companyForm.official_website.trim() && (companyDialog.mode === 'create' || companyForm.official_website.trim() !== (companyDialog.company.official_website || '').trim()) && <label className="checkbox-label"><input type="checkbox" checked={websiteConfirmed} onChange={(event) => setWebsiteConfirmed(event.target.checked)} />I confirm this is the company’s official website and is suitable as a research starting point.</label>}
             <label>Research notes<textarea rows="3" maxLength="10000" value={companyForm.notes} onChange={(event) => setCompanyForm({ ...companyForm, notes: event.target.value })} /></label>
-            <div className="modal-actions"><button type="button" className="button button-outline" onClick={() => setCompanyDialog(null)}>Cancel</button><button className="button button-primary" disabled={saving}>{saving ? 'Saving…' : 'Save company'}</button></div>
+            <div className="modal-actions"><button type="button" className="button button-outline" disabled={saving} onClick={() => setCompanyDialog(null)}>Cancel</button><button className="button button-primary" disabled={saving || (Boolean(companyForm.official_website.trim()) && (companyDialog.mode === 'create' || companyForm.official_website.trim() !== (companyDialog.company.official_website || '').trim()) && !websiteConfirmed)}>{saving ? 'Saving…' : 'Save company'}</button></div>
           </form>
+        </div>
+      )}
+
+      {researchDialog && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !researching) setResearchDialog(null); }}>
+          <div className="modal-card">
+            <div className="modal-heading"><div><p className="eyebrow">CONFIRM RESEARCH</p><h2>Start a research run?</h2></div><button type="button" className="icon-button" disabled={researching} onClick={() => setResearchDialog(null)} aria-label="Close">×</button></div>
+            <p className="muted">The researcher will use only the saved official website for <strong>{researchDialog.company_name}</strong>:</p>
+            <p className="source-link">{researchDialog.official_website}</p>
+            <label className="checkbox-label"><input type="checkbox" checked={researchConfirmed} onChange={(event) => setResearchConfirmed(event.target.checked)} />I have checked this official website and authorize a research run.</label>
+            <div className="modal-actions"><button type="button" className="button button-outline" disabled={researching} onClick={() => setResearchDialog(null)}>Cancel</button><button type="button" className="button button-primary" disabled={!researchConfirmed || researching} onClick={() => void confirmResearch()}>{researching ? 'Starting…' : 'Start research'}</button></div>
+          </div>
         </div>
       )}
 
@@ -413,7 +662,7 @@ function App() {
           <div className="modal-card document-modal">
             <div className="modal-heading"><div><p className="eyebrow">SOURCE DOCUMENT</p><h2>{document.title}</h2></div><button className="icon-button" onClick={() => setDocument(null)} aria-label="Close">×</button></div>
             <a className="source-link" href={document.source_url} target="_blank" rel="noreferrer">{document.source_url} ↗</a>
-            <Status value={document.processing_status} />
+            <Status value={document.processing_status || document.status} />
             {document.processing_error && <p className="muted">{document.processing_error}</p>}
             <pre className="document-text">{document.extracted_text || 'No extractable text is stored for this source.'}</pre>
           </div>
@@ -427,7 +676,7 @@ function pageLabel(page) {
   return { dashboard: 'Overview', companies: 'Companies', research: 'Research runs' }[page] || 'Workspace';
 }
 
-function Dashboard({ dashboard, onPage, onCompany }) {
+function Dashboard({ dashboard, onPage, onCompany, onDetails }) {
   const metrics = [
     ['Total companies', dashboard.total_companies, 'In the research directory'],
     ['Researched', dashboard.researched_companies, 'With at least one run'],
@@ -440,7 +689,7 @@ function Dashboard({ dashboard, onPage, onCompany }) {
       <div className="welcome-row"><div><p className="eyebrow">CSR RESEARCH WORKSPACE</p><h1>Research, with evidence.</h1><p className="muted">A source-first workspace for company CSR research and human review.</p></div><button className="button button-primary" onClick={() => onPage('companies')}>Browse companies <span>→</span></button></div>
       <div className="metric-grid">{metrics.map(([label, value, hint]) => <article className="metric-card" key={label}><span>{label}</span><strong>{value ?? '—'}</strong><small>{hint}</small></article>)}</div>
       <div className="section-heading"><div><p className="eyebrow">LATEST ACTIVITY</p><h2>Recent research runs</h2></div><button className="text-button" onClick={() => onPage('research')}>All runs <span>→</span></button></div>
-      <ResearchRuns runs={dashboard.recent_runs || []} onCompany={onCompany} />
+      <ResearchRuns runs={dashboard.recent_runs || []} onCompany={onCompany} onDetails={onDetails} />
       <div className="callout"><span className="callout-icon">i</span><div><strong>Research assistance, not verification</strong><p>Extracted information retains source evidence and stays pending until a researcher reviews it.</p></div></div>
     </section>
   );
@@ -467,12 +716,12 @@ function CompanyTable({ companies, onOpen, onEdit, onDelete, onResearch }) {
   );
 }
 
-function ResearchRuns({ runs, onCompany }) {
+function ResearchRuns({ runs, onCompany, onDetails }) {
   if (!runs.length) return <div className="empty-state compact-empty"><p>No research runs yet. Add a company and confirm its official website to start.</p></div>;
   return (
     <div className="table-wrap">
       <table>
-        <thead><tr><th>Company</th><th>Status</th><th>Progress</th><th>Pages</th><th>Documents</th><th>Findings</th><th>Started</th></tr></thead>
+        <thead><tr><th>Company</th><th>Status</th><th>Progress</th><th>Pages</th><th>Documents</th><th>Findings</th><th>Started</th><th><span className="sr-only">Actions</span></th></tr></thead>
         <tbody>{runs.map((run) => (
           <tr key={run.id}>
             <td><button className="company-link" onClick={() => onCompany(run)}>{run.company_name}</button><small className="table-subtitle">Run #{run.id}</small></td>
@@ -482,10 +731,56 @@ function ResearchRuns({ runs, onCompany }) {
             <td>{run.documents_processed || 0} / {run.documents_discovered || 0}</td>
             <td>{run.findings_count || 0}</td>
             <td>{formatDate(run.created_at)}</td>
+            <td><div className="row-actions"><button onClick={() => onDetails?.(run)}>Open report</button></div></td>
           </tr>
         ))}</tbody>
       </table>
     </div>
+  );
+}
+
+function ResearchRunDetail({ detail, loading, error, onBack, onCompany }) {
+  if (loading) return <div className="loading-card">Loading the saved research report…</div>;
+  if (error) return <div className="empty-state"><h2>Could not load this research run</h2><p>{error}</p><button className="button button-outline" onClick={onBack}>Back to run history</button></div>;
+  if (!detail?.research_run) return <div className="empty-state"><h2>Research run unavailable</h2><p>The saved run detail response did not include a research run.</p><button className="button button-outline" onClick={onBack}>Back to run history</button></div>;
+  const { research_run: run, company, documents = [], findings = [] } = detail;
+  return (
+    <section>
+      <div className="page-heading no-print">
+        <div><button className="back-link" onClick={onBack}>← All research runs</button><p className="eyebrow">SAVED RUN REPORT · #{run.id}</p><h1>{company?.company_name || `Research run ${run.id}`}</h1><p className="muted">Started {formatDate(run.created_at)} · {documents.length} documents · {findings.length} findings</p></div>
+        <div className="page-actions"><button className="button button-outline" onClick={() => downloadRunCsv(detail)}>Export report CSV</button><button className="button button-primary" onClick={() => window.print()}>Print report</button></div>
+      </div>
+      <article className="info-card print-report">
+        <div className="report-title"><p className="eyebrow">RESEARCH REPORT</p><h1>{company?.company_name || `Research run ${run.id}`}</h1><p className="muted">Run #{run.id} · Started {formatDate(run.created_at)}{run.completed_at ? ` · Completed ${formatDate(run.completed_at)}` : ''}</p></div>
+        <div className="profile-meta"><Status value={run.status} />{company?.industry && <span>{company.industry}</span>}{company?.official_website && <a className="source-link" href={company.official_website} target="_blank" rel="noreferrer">{company.official_website} ↗</a>}</div>
+        {run.progress_message && <p className="report-message">{run.progress_message}</p>}
+        {run.warning_summary && <p className="warning-detail report-notice">Warnings: {run.warning_summary}</p>}
+        {run.error_summary && <p className="error-detail report-notice">Errors: {run.error_summary}</p>}
+        <div className="report-stats"><span><strong>{run.pages_visited ?? 0}</strong> pages visited</span><span><strong>{documents.length}</strong> saved documents</span><span><strong>{findings.length}</strong> findings</span></div>
+        <div className="section-heading"><div><p className="eyebrow">SOURCE MATERIAL</p><h2>Documents and pages</h2></div></div>
+        {documents.length ? <div className="report-list">{documents.map((item) => (
+          <article className="report-item" key={item.id}>
+            <div className="finding-top"><strong>{item.title || item.source_url || `Document ${item.id}`}</strong><Status value={item.processing_status || item.status} /></div>
+            {item.source_url && <a className="source-link" href={item.source_url} target="_blank" rel="noreferrer">{item.source_url} ↗</a>}
+            {item.processing_error && <p className="error-detail report-notice">{item.processing_error}</p>}
+            {item.extracted_text && <details><summary>View extracted text</summary><pre className="document-text">{item.extracted_text}</pre></details>}
+          </article>
+        ))}</div> : <p className="muted">No documents were saved for this run.</p>}
+        <div className="section-heading"><div><p className="eyebrow">HUMAN REVIEW</p><h2>Findings and evidence</h2></div></div>
+        {findings.length ? <div className="report-list">{findings.map((finding) => (
+          <article className="report-item" key={finding.id}>
+            <div className="finding-top"><strong className="field-name">{(finding.field_name || 'Finding').replaceAll('_', ' ')}</strong><Status value={finding.review_status} /></div>
+            <p className="report-value">{finding.finding_value || 'No reviewed value recorded.'}</p>
+            {finding.original_value != null && finding.original_value !== finding.finding_value && <p className="original-value"><strong>Original extracted value</strong><span>{finding.original_value}</span></p>}
+            {finding.financial_year && <p className="muted">Financial year: {finding.financial_year}</p>}
+            {finding.reviewer_notes && <p className="reviewer-notes"><strong>Reviewer notes</strong><br />{finding.reviewer_notes}</p>}
+            {finding.supporting_excerpt && <blockquote>{finding.supporting_excerpt}</blockquote>}
+            {finding.source_url && <a className="source-link" href={finding.source_url} target="_blank" rel="noreferrer">{finding.source_url}{finding.page_number ? ` · page ${finding.page_number}` : ''} ↗</a>}
+          </article>
+        ))}</div> : <p className="muted">No findings were saved for this run.</p>}
+        {company?.id && <button className="button button-outline no-print" onClick={() => onCompany(company.id)}>Open company profile</button>}
+      </article>
+    </section>
   );
 }
 
@@ -495,13 +790,16 @@ function CompanyProfile({
   onEdit,
   onDelete,
   onResearch,
+  onRunDetails,
   onDocument,
   onSaveFinding,
+  savingFinding,
   findingEdits,
   setFindingEdits,
   unavailableField,
   setUnavailableField,
   onMarkUnavailable,
+  markingUnavailable,
 }) {
   if (!profile) return <div className="loading-card">Loading company profile…</div>;
   const { company, research_runs: runs, documents, findings } = profile;
@@ -521,20 +819,23 @@ function CompanyProfile({
         <article className="document-row" key={item.id}>
           <span className="doc-icon">{item.file_type?.includes('pdf') ? 'PDF' : 'WEB'}</span>
           <div className="doc-description"><strong>{item.title}</strong><a href={item.source_url} target="_blank" rel="noreferrer">{item.source_url} ↗</a></div>
-          <Status value={item.processing_status} />
+          <Status value={item.processing_status || item.status} />
+          {item.processing_error && <span className="error-detail">{item.processing_error}</span>}
           <button className="button button-outline button-small" onClick={() => onDocument(item.id)}>View text</button>
         </article>
       ))}</div> : <div className="empty-state compact-empty"><p>No source documents recorded. Start research to crawl the confirmed website.</p></div>}
 
       <div className="section-heading"><div><p className="eyebrow">HUMAN REVIEW</p><h2>Extracted findings</h2></div></div>
-      <div className="unavailable-form"><span>Record information not found</span><select value={unavailableField} onChange={(event) => setUnavailableField(event.target.value)} aria-label="Field not found"><option value="">Select a CSR field…</option>{unavailableFields.map((field) => <option value={field} key={field}>{field}</option>)}</select><button className="button button-outline button-small" disabled={!unavailableField} onClick={onMarkUnavailable}>Mark unavailable</button></div>
+      <div className="unavailable-form"><span>Record information not found</span><select value={unavailableField} onChange={(event) => setUnavailableField(event.target.value)} aria-label="Field not found"><option value="">Select a CSR field…</option>{unavailableFields.map((field) => <option value={field} key={field}>{field}</option>)}</select><button className="button button-outline button-small" disabled={!unavailableField || markingUnavailable} onClick={onMarkUnavailable}>{markingUnavailable ? 'Saving…' : 'Mark unavailable'}</button></div>
       {findings.length ? <div className="finding-list">{findings.map((finding) => {
         const edit = findingEdits[finding.id] || {};
         return (
           <article className="finding-card" key={finding.id}>
             <div className="finding-top"><div><span className="field-name">{finding.field_name.replaceAll('_', ' ')}</span>{finding.extraction_method && <span className="method-tag">{finding.extraction_method} extraction</span>}</div><Status value={edit.review_status || finding.review_status} /></div>
-            <label>Extracted information<textarea rows="2" value={edit.finding_value ?? finding.finding_value} onChange={(event) => setFindingEdits((current) => ({ ...current, [finding.id]: { ...current[finding.id], finding_value: event.target.value } }))} /></label>
-            <div className="finding-meta"><label>Financial year<input value={edit.financial_year ?? finding.financial_year ?? ''} placeholder="Not stated" onChange={(event) => setFindingEdits((current) => ({ ...current, [finding.id]: { ...current[finding.id], financial_year: event.target.value } }))} /></label><label>Review decision<select value={edit.review_status || finding.review_status} onChange={(event) => setFindingEdits((current) => ({ ...current, [finding.id]: { ...current[finding.id], review_status: event.target.value } }))}>{['pending_review', 'approved', 'rejected', 'unavailable'].map((status) => <option key={status} value={status}>{statusLabels[status]}</option>)}</select></label><button className="button button-primary button-small" onClick={() => onSaveFinding(finding)}>Save review</button></div>
+            {finding.original_value != null && finding.original_value !== (edit.finding_value ?? finding.finding_value) && <div className="original-value"><strong>Original extracted value</strong><span>{finding.original_value}</span></div>}
+            <label>Reviewed finding value<textarea rows="2" value={edit.finding_value ?? finding.finding_value ?? ''} onChange={(event) => setFindingEdits((current) => ({ ...current, [finding.id]: { ...current[finding.id], finding_value: event.target.value } }))} /></label>
+            <div className="finding-meta"><label>Financial year<input value={edit.financial_year ?? finding.financial_year ?? ''} placeholder="Not stated" onChange={(event) => setFindingEdits((current) => ({ ...current, [finding.id]: { ...current[finding.id], financial_year: event.target.value } }))} /></label><label>Review decision<select value={edit.review_status || finding.review_status} onChange={(event) => setFindingEdits((current) => ({ ...current, [finding.id]: { ...current[finding.id], review_status: event.target.value } }))}>{['pending_review', 'approved', 'rejected', 'unavailable'].map((status) => <option key={status} value={status}>{statusLabels[status]}</option>)}</select></label><button className="button button-primary button-small" disabled={savingFinding[finding.id]} onClick={() => onSaveFinding(finding)}>{savingFinding[finding.id] ? 'Saving…' : 'Save review'}</button></div>
+            <label>Reviewer notes<textarea rows="2" value={edit.reviewer_notes ?? finding.reviewer_notes ?? ''} placeholder="Add review context, corrections, or follow-up notes" onChange={(event) => setFindingEdits((current) => ({ ...current, [finding.id]: { ...current[finding.id], reviewer_notes: event.target.value } }))} /></label>
             <blockquote>{finding.supporting_excerpt}</blockquote>
             {finding.source_url ? <a className="source-link" href={finding.source_url} target="_blank" rel="noreferrer">{finding.source_url}{finding.page_number ? ` · page ${finding.page_number}` : ''} ↗</a> : <span className="muted">Manually recorded; no source evidence available.</span>}
           </article>
@@ -542,7 +843,7 @@ function CompanyProfile({
       })}</div> : <div className="empty-state compact-empty"><p>No findings have been extracted. The local pipeline reports only text supported by discovered pages or documents.</p></div>}
 
       <div className="section-heading"><div><p className="eyebrow">HISTORY</p><h2>Research runs</h2></div></div>
-      <ResearchRuns runs={runs.map((run) => ({ ...run, company_name: company.company_name }))} onCompany={() => {}} />
+      <ResearchRuns runs={runs.map((run) => ({ ...run, company_name: company.company_name }))} onCompany={() => {}} onDetails={onRunDetails} />
     </section>
   );
 }

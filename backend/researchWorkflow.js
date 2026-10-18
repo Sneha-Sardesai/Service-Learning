@@ -21,6 +21,15 @@ async function createRun(companyId) {
       error.status = 400;
       throw error;
     }
+    const [activeRuns] = await connection.execute(
+      'SELECT id FROM research_runs WHERE company_id = ? AND status IN ("queued", "running") LIMIT 1',
+      [companyId],
+    );
+    if (activeRuns.length) {
+      const error = new Error('Research is already in progress for this company.');
+      error.status = 409;
+      throw error;
+    }
     const [insert] = await connection.execute(
       'INSERT INTO research_runs (company_id, status, progress_message) VALUES (?, "queued", "Waiting to start")',
       [companyId],
@@ -96,7 +105,6 @@ async function saveResearchResult(companyId, runId, result) {
            storage_name, extracted_text, processing_status, processing_error, downloaded_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON DUPLICATE KEY UPDATE
-           research_run_id = VALUES(research_run_id),
            title = VALUES(title),
            file_type = VALUES(file_type),
            content_hash = VALUES(content_hash),
@@ -124,21 +132,28 @@ async function saveResearchResult(companyId, runId, result) {
         'SELECT id FROM documents WHERE company_id = ? AND url_hash = ?',
         [companyId, urlHash],
       );
-      if (rows.length) documentIds.set(document.url, rows[0].id);
+      if (rows.length) {
+        documentIds.set(document.url, rows[0].id);
+        await connection.execute(
+          'INSERT IGNORE INTO research_run_documents (research_run_id, document_id) VALUES (?, ?)',
+          [runId, rows[0].id],
+        );
+      }
     }
     for (const finding of counts.findings) {
       const digest = evidenceHash(finding);
       await connection.execute(
         `INSERT IGNORE INTO findings
-          (company_id, research_run_id, document_id, field_name, finding_value,
+          (company_id, research_run_id, document_id, field_name, finding_value, original_value,
            financial_year, source_url, page_number, supporting_excerpt, extraction_method,
            review_status, evidence_hash)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_review', ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_review', ?)`,
         [
           companyId,
           runId,
           documentIds.get(finding.source_url) || null,
           finding.field_name,
+          finding.value,
           finding.value,
           finding.financial_year || null,
           finding.source_url,
@@ -150,6 +165,16 @@ async function saveResearchResult(companyId, runId, result) {
           digest,
         ],
       );
+      const [findingRows] = await connection.execute(
+        'SELECT id FROM findings WHERE company_id = ? AND evidence_hash = ?',
+        [companyId, digest],
+      );
+      if (findingRows.length) {
+        await connection.execute(
+          'INSERT IGNORE INTO research_run_findings (research_run_id, finding_id) VALUES (?, ?)',
+          [runId, findingRows[0].id],
+        );
+      }
     }
     const status = ['completed', 'partially_completed', 'failed'].includes(result.status)
       ? result.status

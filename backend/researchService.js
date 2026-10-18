@@ -48,14 +48,25 @@ function runResearch(companyName, website = '', options = {}) {
       env: process.env,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
-    let stdoutBuffer = '';
+    let result;
+    let stdoutDiagnostics = '';
     let stderr = '';
     let outputBytes = 0;
-    const timeoutMs = Number(process.env.RESEARCH_TIMEOUT_MS || 10 * 60 * 1000);
+    const configuredTimeout = Number(process.env.RESEARCH_TIMEOUT_MS || 10 * 60 * 1000);
+    const timeoutMs = Number.isFinite(configuredTimeout) && configuredTimeout >= 1000
+      ? Math.min(configuredTimeout, 30 * 60 * 1000)
+      : 10 * 60 * 1000;
     const outputLimit = 30 * 1024 * 1024;
+    let settled = false;
+    const fail = (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      reject(error);
+    };
     const timeout = setTimeout(() => {
       child.kill();
-      reject(new Error('Research timed out. Reduce crawl limits or try again later.'));
+      fail(new Error('Research timed out. Reduce crawl limits or try again later.'));
     }, timeoutMs);
     const lines = readline.createInterface({ input: child.stdout });
 
@@ -63,36 +74,44 @@ function runResearch(companyName, website = '', options = {}) {
       outputBytes += Buffer.byteLength(line);
       if (outputBytes > outputLimit) {
         child.kill();
-        reject(new Error('Research output exceeded its safety limit.'));
+        fail(new Error('Research output exceeded its safety limit.'));
         return;
       }
       try {
         const event = JSON.parse(line);
-        if (event.event === 'progress') {
-          if (options.onProgress) options.onProgress(event);
-        } else if (event.error) {
-          stdoutBuffer = JSON.stringify(event);
-        } else {
-          stdoutBuffer = line;
+        if (event && typeof event === 'object' && event.event === 'progress') {
+          try {
+            if (options.onProgress) options.onProgress(event);
+          } catch (error) {
+            child.kill();
+            fail(new Error(`Research progress handling failed: ${error.message}`));
+          }
+        } else if (event && typeof event === 'object'
+          && (event.error || (typeof event.status === 'string'
+            && Array.isArray(event.documents)
+            && Array.isArray(event.findings)))) {
+          result = event;
+        } else if (line.trim()) {
+          stdoutDiagnostics += `${line}\n`;
         }
       } catch {
-        stdoutBuffer += `${line}\n`;
+        if (line.trim()) stdoutDiagnostics += `${line}\n`;
       }
     });
     child.stderr.on('data', (chunk) => {
       if (Buffer.byteLength(stderr) < 64 * 1024) stderr += chunk.toString();
     });
-    child.once('error', () => {
-      clearTimeout(timeout);
-      reject(new Error('Could not start the Python research engine. Check PYTHON_EXECUTABLE and the virtual environment.'));
+    child.once('error', (error) => {
+      fail(new Error(
+        `Could not start the Python research engine. Check PYTHON_EXECUTABLE and the virtual environment. ${error.code || ''}`.trim(),
+      ));
     });
     child.once('close', (code) => {
+      if (settled) return;
       clearTimeout(timeout);
-      let result;
-      try {
-        result = JSON.parse(stdoutBuffer.trim());
-      } catch {
-        reject(new Error(stderrSummary(stderr)));
+      settled = true;
+      if (!result) {
+        reject(new Error(stderrSummary(stderr || stdoutDiagnostics)));
         return;
       }
       if (code !== 0 || result.error) {

@@ -77,6 +77,7 @@ CREATE TABLE IF NOT EXISTS findings (
   document_id BIGINT UNSIGNED NULL,
   field_name VARCHAR(120) NOT NULL,
   finding_value TEXT NOT NULL,
+  original_value TEXT NOT NULL,
   financial_year VARCHAR(20) NULL,
   source_url VARCHAR(2048) NOT NULL,
   page_number INT UNSIGNED NULL,
@@ -96,4 +97,20 @@ CREATE TABLE IF NOT EXISTS findings (
   CONSTRAINT fk_findings_company FOREIGN KEY (company_id) REFERENCES companies(id) ON DELETE CASCADE,
   CONSTRAINT fk_findings_run FOREIGN KEY (research_run_id) REFERENCES research_runs(id) ON DELETE CASCADE,
   CONSTRAINT fk_findings_document FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE SET NULL
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS research_run_documents (
+  research_run_id BIGINT UNSIGNED NOT NULL,
+  document_id BIGINT UNSIGNED NOT NULL,
+  PRIMARY KEY (research_run_id, document_id),
+  CONSTRAINT fk_run_documents_run FOREIGN KEY (research_run_id) REFERENCES research_runs(id) ON DELETE CASCADE,
+  CONSTRAINT fk_run_documents_document FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS research_run_findings (
+  research_run_id BIGINT UNSIGNED NOT NULL,
+  finding_id BIGINT UNSIGNED NOT NULL,
+  PRIMARY KEY (research_run_id, finding_id),
+  CONSTRAINT fk_run_findings_run FOREIGN KEY (research_run_id) REFERENCES research_runs(id) ON DELETE CASCADE,
+  CONSTRAINT fk_run_findings_finding FOREIGN KEY (finding_id) REFERENCES findings(id) ON DELETE CASCADE
 ) ENGINE=InnoDB;
