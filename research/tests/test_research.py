@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -18,6 +19,7 @@ sys.path.insert(0, str(RESEARCH_DIR))
 import crawler
 from document_extractor import process_documents
 from information_extractor import extract_findings, extract_with_gemini
+import research
 from research import resolve_website, run_research
 
 
@@ -67,6 +69,22 @@ class FakeSession:
 
 
 class ResearchTests(unittest.TestCase):
+    def test_json_output_escapes_non_ascii_for_windows_pipe_encoding(self):
+        output = io.StringIO()
+        with (
+            patch.object(sys, "argv", ["research.py", "Example Company", "--website", "https://example.test", "--json"]),
+            patch("research.resolve_website", return_value="https://example.test/"),
+            patch("research.run_research", return_value={
+                "status": "completed",
+                "findings": [{"value": "₹ 1 crore"}],
+            }),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(research.main(), 0)
+        serialized = output.getvalue()
+        self.assertIn(r"\u20b9", serialized)
+        self.assertEqual(json.loads(serialized)["findings"][0]["value"], "₹ 1 crore")
+
     def test_url_normalization_and_ssrf_guards(self):
         self.assertEqual(
             crawler.normalize_url("HTTPS://Example.COM/report#page"),

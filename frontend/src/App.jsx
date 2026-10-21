@@ -1,8 +1,20 @@
 import { useEffect, useRef, useState } from 'react';
-import { api } from './api';
+import { api, upload } from './api';
 import './index.css';
 
-const emptyCompany = { company_name: '', industry: '', official_website: '', notes: '' };
+const emptyCompany = {
+  company_name: '',
+  cin: '',
+  industry: '',
+  city: '',
+  official_website: '',
+  contact_email: '',
+  contact_phone: '',
+  contact_name: '',
+  contact_designation: '',
+  priority: '',
+  notes: '',
+};
 const statusLabels = {
   not_started: 'Not researched',
   queued: 'Queued',
@@ -115,6 +127,7 @@ function App() {
   const [document, setDocument] = useState(null);
   const [findingEdits, setFindingEdits] = useState({});
   const [savingFinding, setSavingFinding] = useState({});
+  const [findingHistory, setFindingHistory] = useState({});
   const [markingUnavailable, setMarkingUnavailable] = useState(false);
   const [unavailableField, setUnavailableField] = useState('');
   const [researchRuns, setResearchRuns] = useState([]);
@@ -126,6 +139,13 @@ function App() {
   const [runDetail, setRunDetail] = useState(null);
   const [runDetailLoading, setRunDetailLoading] = useState(false);
   const [runDetailError, setRunDetailError] = useState('');
+  const [importOpen, setImportOpen] = useState(false);
+  const [importFile, setImportFile] = useState(null);
+  const [importScan, setImportScan] = useState(null);
+  const [importMappings, setImportMappings] = useState({});
+  const [importPreview, setImportPreview] = useState(null);
+  const [importResolutions, setImportResolutions] = useState({});
+  const [importBusy, setImportBusy] = useState(false);
   const submissions = useRef(new Set());
 
   async function loadDashboard() {
@@ -324,8 +344,15 @@ function App() {
   function openEditCompany(company) {
     setCompanyForm({
       company_name: company.company_name || '',
+      cin: company.cin || '',
       industry: company.industry || '',
+      city: company.city || '',
       official_website: company.official_website || '',
+      contact_email: company.contact_email || '',
+      contact_phone: company.contact_phone || '',
+      contact_name: company.contact_name || '',
+      contact_designation: company.contact_designation || '',
+      priority: company.priority || '',
       notes: company.notes || '',
     });
     setWebsiteConfirmed(false);
@@ -347,7 +374,22 @@ function App() {
     setError('');
     try {
       const isEdit = companyDialog.mode === 'edit';
-      await api(isEdit ? `/companies/${companyDialog.company.id}` : '/companies', {
+      if (!isEdit) {
+        const params = new URLSearchParams({
+          name: companyForm.company_name.trim(),
+          ...(companyForm.cin.trim() ? { cin: companyForm.cin.trim() } : {}),
+        });
+        const { matches = [] } = await api(`/companies/matches?${params}`);
+        if (matches.length) {
+          if (window.confirm(`${matches[0].company_name} is already in the registry. Open that existing company instead?`)) {
+            setCompanyDialog(null);
+            await openProfile(matches[0]);
+            return;
+          }
+          throw new Error('A matching company already exists. Select the existing registry record to continue.');
+        }
+      }
+      const result = await api(isEdit ? `/companies/${companyDialog.company.id}` : '/companies', {
         method: isEdit ? 'PATCH' : 'POST',
         body: JSON.stringify({
           ...companyForm,
@@ -355,7 +397,13 @@ function App() {
         }),
       });
       setCompanyDialog(null);
-      setNotice(isEdit ? 'Company details updated.' : 'Company added to the directory.');
+      setNotice(isEdit
+        ? 'Company details updated.'
+        : `Company added and research run ${result.research_run.id} queued.`);
+      if (!isEdit && result.research_run) {
+        setPage('research');
+        setResearchPage(1);
+      }
       await Promise.all([loadCompanies(), loadDashboard()]);
       if (selectedCompany && isEdit) await loadProfile(selectedCompany.id);
     } catch (requestError) {
@@ -363,6 +411,61 @@ function App() {
     } finally {
       setSaving(false);
       submissions.current.delete('company');
+    }
+  }
+
+  async function scanImport(file, sheet) {
+      setImportBusy(true);
+      setError('');
+      try {
+        const scanned = await upload('/imports/scan', file, { sheet });
+        setImportFile(file);
+        setImportScan(scanned);
+        setImportMappings(scanned.suggested_mappings || {});
+        setImportPreview(null);
+        setImportResolutions({});
+      } catch (requestError) {
+        setError(requestError.message);
+      } finally {
+        setImportBusy(false);
+      }
+    }
+
+  async function previewImport() {
+      if (!importFile || !importScan) return;
+      setImportBusy(true);
+      setError('');
+      try {
+        const data = await upload('/imports/preview', importFile, {
+          mappings: importMappings,
+          sheet: importScan.selected_sheet,
+        });
+        setImportPreview(data);
+        setImportResolutions({});
+      } catch (requestError) {
+        setError(requestError.message);
+      } finally {
+        setImportBusy(false);
+      }
+    }
+
+  async function confirmImport() {
+      if (!importFile || !importPreview || importBusy) return;
+      setImportBusy(true);
+      setError('');
+      try {
+        const result = await upload('/imports/confirm', importFile, {
+          mappings: importMappings,
+          sheet: importScan.selected_sheet,
+          resolutions: importResolutions,
+        });
+        setImportOpen(false);
+        setNotice(`Import batch ${result.import_batch.id} saved: ${result.import_batch.imported_rows} rows, ${result.import_batch.error_rows} validation errors.`);
+        await Promise.all([loadCompanies(), loadDashboard()]);
+      } catch (requestError) {
+        setError(requestError.message);
+      } finally {
+        setImportBusy(false);
     }
   }
 
@@ -482,6 +585,15 @@ function App() {
     }
   }
 
+  async function loadFindingHistory(findingId) {
+    try {
+      const data = await api(`/findings/${findingId}/history`);
+      setFindingHistory((current) => ({ ...current, [findingId]: data.history || [] }));
+    } catch (requestError) {
+      setError(requestError.message);
+    }
+  }
+
   async function markUnavailable() {
     if (!unavailableField || !profile || submissions.current.has('mark-unavailable')) return;
     submissions.current.add('mark-unavailable');
@@ -563,7 +675,7 @@ function App() {
             <section>
               <div className="page-heading">
                 <div><p className="eyebrow">RESEARCH DIRECTORY</p><h1>Companies</h1><p className="muted">Manage official sources and review company research history.</p></div>
-                <button className="button button-primary" onClick={openNewCompany}>＋ Add company</button>
+                <div className="page-actions"><button className="button button-outline" onClick={() => { setImportOpen(true); setImportFile(null); setImportScan(null); setImportPreview(null); }}>Import spreadsheet</button><button className="button button-primary" onClick={openNewCompany}>＋ Add company</button></div>
               </div>
               <div className="filter-bar">
                 <label className="search-box"><span>⌕</span><input value={search} onChange={(event) => { setCompanyPage(1); setSearch(event.target.value); }} placeholder="Search company name…" /></label>
@@ -615,6 +727,8 @@ function App() {
               onRunDetails={(run) => void openRunDetail(run.id)}
               onDocument={showDocument}
               onSaveFinding={saveFinding}
+              onFindingHistory={loadFindingHistory}
+              findingHistory={findingHistory}
               savingFinding={savingFinding}
               findingEdits={findingEdits}
               setFindingEdits={setFindingEdits}
@@ -632,16 +746,50 @@ function App() {
           <form className="modal-card" onSubmit={saveCompany}>
             <div className="modal-heading"><div><p className="eyebrow">{companyDialog.mode === 'edit' ? 'COMPANY DETAILS' : 'NEW RECORD'}</p><h2>{companyDialog.mode === 'edit' ? 'Edit company' : 'Add company'}</h2></div><button type="button" className="icon-button" disabled={saving} onClick={() => setCompanyDialog(null)} aria-label="Close">×</button></div>
             <label>Company name <span className="required">*</span><input autoFocus required maxLength="200" value={companyForm.company_name} onChange={(event) => { setCompanyForm({ ...companyForm, company_name: event.target.value }); setWebsiteConfirmed(false); setDomainSuggestion(null); }} /></label>
+            <label>CIN<input maxLength="21" value={companyForm.cin} onChange={(event) => setCompanyForm({ ...companyForm, cin: event.target.value })} /></label>
             <label>Industry<input maxLength="160" value={companyForm.industry} onChange={(event) => setCompanyForm({ ...companyForm, industry: event.target.value })} placeholder="e.g. Automotive" /></label>
-            <label>Confirmed official website<input type="text" inputMode="url" value={companyForm.official_website} onChange={(event) => { setCompanyForm({ ...companyForm, official_website: event.target.value }); setWebsiteConfirmed(false); }} placeholder="https://www.company.com" /><small>Enter the confirmed domain; the crawler will not guess one.</small></label>
+            <label>Headquarters / city<input maxLength="160" value={companyForm.city} onChange={(event) => setCompanyForm({ ...companyForm, city: event.target.value })} /></label>
+            <label>Confirmed official website {companyDialog.mode === 'create' && <span className="required">*</span>}<input type="text" inputMode="url" required={companyDialog.mode === 'create'} value={companyForm.official_website} onChange={(event) => { setCompanyForm({ ...companyForm, official_website: event.target.value }); setWebsiteConfirmed(false); }} placeholder="https://www.company.com" /><small>Enter a researcher-confirmed domain; the crawler will not guess one.</small></label>
             {suggestionLoading && <p className="suggestion-note" role="status">Checking for a domain suggestion…</p>}
             {!suggestionLoading && domainSuggestion && <div className="domain-suggestion"><div><strong>Registry suggestion</strong><span>{domainSuggestion}</span><small>Suggestion only. Verify the domain before saving or researching.</small></div><button type="button" className="button button-outline button-small" onClick={() => { setCompanyForm((current) => ({ ...current, official_website: domainSuggestion })); setWebsiteConfirmed(false); }}>Use suggestion</button></div>}
             {!suggestionLoading && suggestionError && <p className="suggestion-note" role="status">{suggestionError}</p>}
             {!suggestionLoading && !suggestionError && !domainSuggestion && companyDialog && companyForm.company_name.trim() && <p className="suggestion-note">No domain suggestion was returned for this name.</p>}
-            {companyForm.official_website.trim() && (companyDialog.mode === 'create' || companyForm.official_website.trim() !== (companyDialog.company.official_website || '').trim()) && <label className="checkbox-label"><input type="checkbox" checked={websiteConfirmed} onChange={(event) => setWebsiteConfirmed(event.target.checked)} />I confirm this is the company’s official website and is suitable as a research starting point.</label>}
+            {companyForm.official_website.trim() && (companyDialog.mode === 'create' || companyForm.official_website.trim() !== (companyDialog.company.official_website || '').trim() || !companyDialog.company.official_website_verified_at) && <label className="checkbox-label"><input type="checkbox" checked={websiteConfirmed} onChange={(event) => setWebsiteConfirmed(event.target.checked)} />I confirm this is the company’s official website and is suitable as a research starting point.</label>}
+            <label>Contact email<input type="email" maxLength="254" value={companyForm.contact_email} onChange={(event) => setCompanyForm({ ...companyForm, contact_email: event.target.value })} /></label>
+            <label>Contact phone<input maxLength="40" value={companyForm.contact_phone} onChange={(event) => setCompanyForm({ ...companyForm, contact_phone: event.target.value })} /></label>
+            <label>CSR contact name<input maxLength="200" value={companyForm.contact_name} onChange={(event) => setCompanyForm({ ...companyForm, contact_name: event.target.value })} /></label>
+            <label>Contact designation<input maxLength="160" value={companyForm.contact_designation} onChange={(event) => setCompanyForm({ ...companyForm, contact_designation: event.target.value })} /></label>
+            <label>Research priority<input maxLength="80" value={companyForm.priority} onChange={(event) => setCompanyForm({ ...companyForm, priority: event.target.value })} /></label>
             <label>Research notes<textarea rows="3" maxLength="10000" value={companyForm.notes} onChange={(event) => setCompanyForm({ ...companyForm, notes: event.target.value })} /></label>
-            <div className="modal-actions"><button type="button" className="button button-outline" disabled={saving} onClick={() => setCompanyDialog(null)}>Cancel</button><button className="button button-primary" disabled={saving || (Boolean(companyForm.official_website.trim()) && (companyDialog.mode === 'create' || companyForm.official_website.trim() !== (companyDialog.company.official_website || '').trim()) && !websiteConfirmed)}>{saving ? 'Saving…' : 'Save company'}</button></div>
+            <div className="modal-actions"><button type="button" className="button button-outline" disabled={saving} onClick={() => setCompanyDialog(null)}>Cancel</button><button className="button button-primary" disabled={saving || (companyDialog.mode === 'create' && !companyForm.official_website.trim()) || (Boolean(companyForm.official_website.trim()) && (companyDialog.mode === 'create' || companyForm.official_website.trim() !== (companyDialog.company.official_website || '').trim() || !companyDialog.company.official_website_verified_at) && !websiteConfirmed)}>{saving ? 'Saving…' : companyDialog.mode === 'create' ? 'Add and start research' : 'Save company'}</button></div>
           </form>
+        </div>
+      )}
+
+      {importOpen && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !importBusy) setImportOpen(false); }}>
+          <div className="modal-card import-dialog">
+            <div className="modal-heading"><div><p className="eyebrow">COMPANY REGISTRY</p><h2>Import spreadsheet</h2></div><button type="button" className="icon-button" disabled={importBusy} onClick={() => setImportOpen(false)} aria-label="Close">×</button></div>
+            <p className="muted">CSV, XLS and XLSX are supported. Scan and preview do not write to MySQL. Imported domains remain candidates until a researcher confirms them.</p>
+            <label>Spreadsheet file<input type="file" accept=".csv,.xls,.xlsx" disabled={importBusy} onChange={(event) => {
+              const file = event.target.files?.[0];
+              if (file) void scanImport(file);
+            }} /></label>
+            {importScan && <>
+              {importScan.sheets.length > 1 && <label>Worksheet<select value={importScan.selected_sheet} disabled={importBusy} onChange={(event) => void scanImport(importFile, event.target.value)}>{importScan.sheets.map((item) => <option key={item.name} value={item.name}>{item.name}</option>)}</select></label>}
+              <p className="suggestion-note">{importScan.filename} · {importScan.headers.length} columns · {importPreview ? `${importPreview.row_count} data rows` : 'Choose a mapping for each relevant column.'}</p>
+              <div className="mapping-list">{importScan.headers.map((header) => (
+                <label key={header}><span title={header}>{header || '(empty header)'}</span><select value={importMappings[header] || ''} onChange={(event) => { setImportMappings((current) => ({ ...current, [header]: event.target.value })); setImportPreview(null); }}><option value="">Ignore column</option>{importScan.import_fields.map((field) => <option key={field} value={field}>{field.replaceAll('_', ' ')}</option>)}</select></label>
+              ))}</div>
+              <div className="modal-actions"><button className="button button-outline" disabled={importBusy || !Object.values(importMappings).includes('company_name')} onClick={() => void previewImport()}>{importBusy ? 'Working…' : 'Preview and validate'}</button></div>
+            </>}
+            {importPreview && <>
+              <p className="muted">Valid rows: {importPreview.valid_rows} · Rows with errors: {importPreview.error_rows}. Review matches and skip any rows you do not want merged.</p>
+              <div className="table-wrap import-preview"><table><thead><tr><th>Row</th><th>Company</th><th>Resolution</th><th>Validation</th></tr></thead><tbody>{importPreview.rows.slice(0, 200).map((row) => <tr key={row.row_number}><td>{row.row_number}</td><td>{row.mapped.company_name || '—'}</td><td>{row.validation_errors.length ? 'Invalid' : <select aria-label={`Resolve row ${row.row_number}`} value={importResolutions[row.row_number] || 'use_existing'} onChange={(event) => setImportResolutions((current) => ({ ...current, [row.row_number]: event.target.value }))}><option value="use_existing">{row.matched_company ? `Merge: ${row.matched_company.company_name}` : row.duplicate_of_row ? `Merge row ${row.duplicate_of_row}` : 'Create or merge'}</option><option value="skip">Skip this row</option></select>}</td><td>{row.validation_errors.join('; ') || (row.duplicate_of_row ? `Duplicate of row ${row.duplicate_of_row}` : '')}</td></tr>)}</tbody></table></div>
+              {importPreview.rows.length > 200 && <p className="suggestion-note">Showing first 200 of {importPreview.rows.length} rows. All rows are included in validation and import.</p>}
+              <div className="modal-actions"><button className="button button-outline" disabled={importBusy} onClick={() => setImportPreview(null)}>Back to mappings</button><button className="button button-primary" disabled={importBusy} onClick={() => void confirmImport()}>{importBusy ? 'Importing…' : 'Confirm import'}</button></div>
+            </>}
+          </div>
         </div>
       )}
 
@@ -703,8 +851,8 @@ function CompanyTable({ companies, onOpen, onEdit, onDelete, onResearch }) {
         <thead><tr><th>Company</th><th>Industry</th><th>Research status</th><th>Documents</th><th>Last researched</th><th><span className="sr-only">Actions</span></th></tr></thead>
         <tbody>{companies.map((company) => (
           <tr key={company.id}>
-            <td><button className="company-link" onClick={() => onOpen(company)}>{company.company_name}</button><small className="table-subtitle">{company.official_website || 'Official website not set'}</small></td>
-            <td>{company.industry || '—'}</td>
+            <td><button className="company-link" onClick={() => onOpen(company)}>{company.company_name}</button><small className="table-subtitle">{company.official_website || (company.website_candidate ? `Unverified: ${company.website_candidate}` : 'Official website not set')}</small></td>
+            <td>{[company.industry, company.city].filter(Boolean).join(' · ') || '—'}</td>
             <td><Status value={company.research_status} /></td>
             <td>{company.document_count ?? 0}</td>
             <td>{formatDate(company.last_researched_at)}</td>
@@ -793,6 +941,8 @@ function CompanyProfile({
   onRunDetails,
   onDocument,
   onSaveFinding,
+  onFindingHistory,
+  findingHistory,
   savingFinding,
   findingEdits,
   setFindingEdits,
@@ -807,11 +957,11 @@ function CompanyProfile({
     <section>
       <button className="back-link" onClick={onBack}>← Company directory</button>
       <div className="profile-heading">
-        <div><p className="eyebrow">COMPANY PROFILE</p><h1>{company.company_name}</h1><div className="profile-meta"><Status value={company.research_status} />{company.industry && <span>{company.industry}</span>}<span>Last researched {formatDate(company.last_researched_at)}</span></div></div>
+        <div><p className="eyebrow">COMPANY PROFILE</p><h1>{company.company_name}</h1><div className="profile-meta"><Status value={company.research_status} />{company.industry && <span>{company.industry}</span>}{company.city && <span>{company.city}</span>}{company.cin && <span>CIN {company.cin}</span>}<span>Last researched {formatDate(company.last_researched_at)}</span></div></div>
         <div className="profile-actions"><button className="button button-outline" onClick={onEdit}>Edit details</button><button className="button button-primary" disabled={!company.official_website} onClick={onResearch}>Start research</button><button className="button button-quiet-danger" onClick={onDelete}>Delete</button></div>
       </div>
       <div className="profile-grid">
-        <article className="info-card"><p className="eyebrow">OFFICIAL SOURCE</p>{company.official_website ? <a className="source-link" href={company.official_website} target="_blank" rel="noreferrer">{company.official_website} ↗</a> : <p className="muted">No official website recorded. Add one before starting research.</p>}<p className="notes">{company.notes || 'No researcher notes.'}</p></article>
+        <article className="info-card"><p className="eyebrow">OFFICIAL SOURCE</p>{company.official_website ? <><a className="source-link" href={company.official_website} target="_blank" rel="noreferrer">{company.official_website} ↗</a><p className="muted">{company.official_website_verified_at ? `Domain confirmed ${formatDate(company.official_website_verified_at)}` : 'Legacy domain recorded; confirmation date unavailable.'}</p></> : <><p className="muted">No confirmed official website recorded. Add one before starting research.</p>{company.website_candidate && <p className="suggestion-note">Unverified imported candidate: {company.website_candidate}</p>}</>}<p className="notes">{company.notes || 'No researcher notes.'}</p>{(company.contact_name || company.contact_designation || company.contact_email || company.contact_phone) && <div className="contact-details"><p className="eyebrow">CSR CONTACT</p>{company.contact_name && <p>{company.contact_name}{company.contact_designation ? ` · ${company.contact_designation}` : ''}</p>}{company.contact_email && <p>{company.contact_email}</p>}{company.contact_phone && <p>{company.contact_phone}</p>}</div>}</article>
         <article className="info-card"><p className="eyebrow">RESEARCH SUMMARY</p><div className="mini-stats"><span><strong>{runs.length}</strong> runs</span><span><strong>{documents.length}</strong> sources</span><span><strong>{findings.filter((finding) => finding.review_status === 'pending_review').length}</strong> to review</span></div></article>
       </div>
       <div className="section-heading"><div><p className="eyebrow">SOURCE MATERIAL</p><h2>Discovered documents and pages</h2></div></div>
@@ -831,11 +981,14 @@ function CompanyProfile({
         const edit = findingEdits[finding.id] || {};
         return (
           <article className="finding-card" key={finding.id}>
-            <div className="finding-top"><div><span className="field-name">{finding.field_name.replaceAll('_', ' ')}</span>{finding.extraction_method && <span className="method-tag">{finding.extraction_method} extraction</span>}</div><Status value={edit.review_status || finding.review_status} /></div>
+            <div className="finding-top"><div><span className="field-name">{finding.field_name.replaceAll('_', ' ')}</span>{finding.extraction_method && <span className="method-tag">{finding.extraction_method} extraction</span>}{finding.provenance && <span className="method-tag">{finding.provenance.replaceAll('_', ' ')}</span>}</div><Status value={edit.review_status || finding.review_status} /></div>
+            {(finding.numeric_value !== null || finding.currency || finding.unit) && <p className="muted">Structured amount: {finding.numeric_value ?? '—'} {finding.currency || ''} {finding.unit || ''}</p>}
             {finding.original_value != null && finding.original_value !== (edit.finding_value ?? finding.finding_value) && <div className="original-value"><strong>Original extracted value</strong><span>{finding.original_value}</span></div>}
             <label>Reviewed finding value<textarea rows="2" value={edit.finding_value ?? finding.finding_value ?? ''} onChange={(event) => setFindingEdits((current) => ({ ...current, [finding.id]: { ...current[finding.id], finding_value: event.target.value } }))} /></label>
             <div className="finding-meta"><label>Financial year<input value={edit.financial_year ?? finding.financial_year ?? ''} placeholder="Not stated" onChange={(event) => setFindingEdits((current) => ({ ...current, [finding.id]: { ...current[finding.id], financial_year: event.target.value } }))} /></label><label>Review decision<select value={edit.review_status || finding.review_status} onChange={(event) => setFindingEdits((current) => ({ ...current, [finding.id]: { ...current[finding.id], review_status: event.target.value } }))}>{['pending_review', 'approved', 'rejected', 'unavailable'].map((status) => <option key={status} value={status}>{statusLabels[status]}</option>)}</select></label><button className="button button-primary button-small" disabled={savingFinding[finding.id]} onClick={() => onSaveFinding(finding)}>{savingFinding[finding.id] ? 'Saving…' : 'Save review'}</button></div>
             <label>Reviewer notes<textarea rows="2" value={edit.reviewer_notes ?? finding.reviewer_notes ?? ''} placeholder="Add review context, corrections, or follow-up notes" onChange={(event) => setFindingEdits((current) => ({ ...current, [finding.id]: { ...current[finding.id], reviewer_notes: event.target.value } }))} /></label>
+            <button className="text-button" onClick={() => void onFindingHistory(finding.id)}>Review history</button>
+            {findingHistory[finding.id] && <ol className="review-history">{findingHistory[finding.id].map((item) => <li key={item.id}><strong>{statusLabels[item.decision] || item.decision}</strong> · {formatDate(item.reviewed_at)}{item.reviewer_identity ? ` · ${item.reviewer_identity}` : ''}<span>{item.previous_value || '—'} → {item.revised_value || '—'}</span>{item.reason && <small>{item.reason}</small>}</li>)}</ol>}
             <blockquote>{finding.supporting_excerpt}</blockquote>
             {finding.source_url ? <a className="source-link" href={finding.source_url} target="_blank" rel="noreferrer">{finding.source_url}{finding.page_number ? ` · page ${finding.page_number}` : ''} ↗</a> : <span className="muted">Manually recorded; no source evidence available.</span>}
           </article>

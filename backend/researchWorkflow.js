@@ -4,6 +4,7 @@ const crypto = require('crypto');
 const { query, transaction } = require('./database');
 const { runResearch } = require('./researchService');
 const { normalizeCompanyName, normalizeWebsite, validateCompanyName } = require('./validation');
+const { parseMoney } = require('./money');
 
 async function createRun(companyId) {
   return transaction(async (connection) => {
@@ -31,8 +32,9 @@ async function createRun(companyId) {
       throw error;
     }
     const [insert] = await connection.execute(
-      'INSERT INTO research_runs (company_id, status, progress_message) VALUES (?, "queued", "Waiting to start")',
-      [companyId],
+      `INSERT INTO research_runs (company_id, status, progress_message, confirmed_domain)
+       VALUES (?, "queued", "Waiting to start", ?)`,
+      [companyId, rows[0].official_website],
     );
     await connection.execute(
       'UPDATE companies SET research_status = "queued" WHERE id = ?',
@@ -99,14 +101,25 @@ async function saveResearchResult(companyId, runId, result) {
     const documentIds = new Map();
     for (const document of result.documents || []) {
       const urlHash = crypto.createHash('sha256').update(document.url).digest('hex');
+      const title = (document.title || document.url).slice(0, 500);
+      const documentType = document.document_type || (
+        /brsr|business responsibility/i.test(title) ? 'brsr'
+          : /annual report/i.test(title) ? 'annual_report'
+            : /csr policy/i.test(title) ? 'csr_policy'
+              : null
+      );
       await connection.execute(
         `INSERT INTO documents
-          (company_id, research_run_id, source_url, url_hash, title, file_type, content_hash,
+          (company_id, research_run_id, source_url, url_hash, title, file_type, document_type,
+           financial_year, publication_date, content_hash,
            storage_name, extracted_text, processing_status, processing_error, downloaded_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON DUPLICATE KEY UPDATE
            title = VALUES(title),
            file_type = VALUES(file_type),
+           document_type = COALESCE(VALUES(document_type), document_type),
+           financial_year = COALESCE(VALUES(financial_year), financial_year),
+           publication_date = COALESCE(VALUES(publication_date), publication_date),
            content_hash = VALUES(content_hash),
            storage_name = COALESCE(VALUES(storage_name), storage_name),
            extracted_text = VALUES(extracted_text),
@@ -118,8 +131,11 @@ async function saveResearchResult(companyId, runId, result) {
           runId,
           document.url,
           urlHash,
-          (document.title || document.url).slice(0, 500),
+          title,
           document.file_type || 'unknown',
+          documentType,
+          document.financial_year || null,
+          document.publication_date || null,
           document.content_hash || null,
           document.storage_name || null,
           document.text || null,
@@ -142,12 +158,17 @@ async function saveResearchResult(companyId, runId, result) {
     }
     for (const finding of counts.findings) {
       const digest = evidenceHash(finding);
+      const monetary = /_amount$/.test(finding.field_name || '')
+        ? parseMoney(finding.value)
+        : { numeric: null, currency: null, unit: null };
+      const category = /_amount$/.test(finding.field_name || '') ? 'financial'
+        : /focus_area|project|partner/.test(finding.field_name || '') ? 'programmatic' : 'general';
       await connection.execute(
         `INSERT IGNORE INTO findings
           (company_id, research_run_id, document_id, field_name, finding_value, original_value,
-           financial_year, source_url, page_number, supporting_excerpt, extraction_method,
-           review_status, evidence_hash)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_review', ?)`,
+           finding_category, numeric_value, currency, unit, relevant_focus_area, financial_year, source_url, page_number,
+           supporting_excerpt, extraction_method, provenance, review_status, evidence_hash)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'extracted', 'pending_review', ?)`,
         [
           companyId,
           runId,
@@ -155,6 +176,11 @@ async function saveResearchResult(companyId, runId, result) {
           finding.field_name,
           finding.value,
           finding.value,
+          category,
+          monetary.numeric,
+          monetary.currency,
+          monetary.unit,
+          finding.field_name === 'csr_focus_area' ? finding.value : null,
           finding.financial_year || null,
           finding.source_url,
           finding.page_number || null,
@@ -184,7 +210,7 @@ async function saveResearchResult(companyId, runId, result) {
       `UPDATE research_runs
        SET status = ?, progress_message = ?, pages_visited = ?, documents_discovered = ?,
            documents_processed = ?, findings_count = ?, error_summary = ?,
-           warning_summary = ?, completed_at = NOW()
+           warning_summary = ?, summary = ?, completed_at = NOW()
        WHERE id = ?`,
       [
         status,
@@ -195,6 +221,7 @@ async function saveResearchResult(companyId, runId, result) {
         counts.findings.length,
         summary,
         warnings.slice(0, 30).join('\n').slice(0, 10000) || null,
+        `${counts.documentsProcessed} documents processed; ${counts.findings.length} findings retained for human review.`,
         runId,
       ],
     );
@@ -269,7 +296,7 @@ async function findOrCreateCompany(companyName, website) {
     if (matches.length) {
       if (officialWebsite && officialWebsite !== matches[0].official_website) {
         await connection.execute(
-          'UPDATE companies SET official_website = ? WHERE id = ?',
+          'UPDATE companies SET official_website = ?, official_website_verified_at = NOW() WHERE id = ?',
           [officialWebsite, matches[0].id],
         );
       }
@@ -283,4 +310,10 @@ async function findOrCreateCompany(companyName, website) {
   });
 }
 
-module.exports = { createRun, executeResearchRun, findOrCreateCompany, recoverInterruptedRuns };
+module.exports = {
+  createRun,
+  executeResearchRun,
+  findOrCreateCompany,
+  recoverInterruptedRuns,
+  saveResearchResult,
+};

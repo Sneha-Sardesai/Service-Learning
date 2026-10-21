@@ -140,7 +140,7 @@ tbody tr:hover { background: #fbfcfb; }
 .field-name { color: #345342; font-size: 11px; font-weight: 700; text-transform: capitalize; }
 .method-tag { margin-left: 9px; color: #9aa39d; font-size: 9px; }
 .finding-card label, .modal-card label { display: grid; gap: 6px; color: #57635b; font-size: 10px; font-weight: 600; }
-.finding-card textarea, .finding-card input, .finding-card select, .modal-card input, .modal-card textarea { width: 100%; border: 1px solid #e0e6e1; border-radius: 5px; padding: 9px 10px; outline-color: #75aa8e; color: #39463e; background: #fff; font-size: 10px; resize: vertical; }
+.finding-card textarea, .finding-card input, .finding-card select, .modal-card input, .modal-card textarea, .modal-card select { width: 100%; border: 1px solid #e0e6e1; border-radius: 5px; padding: 9px 10px; outline-color: #75aa8e; color: #39463e; background: #fff; font-size: 10px; resize: vertical; }
 .finding-meta { margin: 10px 0; display: flex; align-items: flex-end; gap: 10px; }
 .finding-meta label { width: 160px; }
 .finding-card blockquote { margin: 11px 0; border-left: 2px solid #8fbea0; padding: 8px 11px; color: #69766e; background: #f7faf7; font-size: 10px; line-height: 1.6; }
@@ -163,6 +163,16 @@ tbody tr:hover { background: #fbfcfb; }
 .required { color: #b2524b; }
 .modal-actions { margin-top: 18px; display: flex; justify-content: flex-end; gap: 8px; }
 .document-modal { width: min(760px, 100%); }
+.import-dialog { width: min(1080px, 100%); }
+.mapping-list { max-height: 28vh; overflow: auto; display: grid; gap: 6px; margin: 10px 0; }
+.mapping-list label { display: grid; grid-template-columns: minmax(140px, 1fr) minmax(180px, 1.2fr); align-items: center; gap: 12px; margin: 0; }
+.mapping-list label span { overflow: hidden; color: #526059; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.import-preview { max-height: 38vh; margin-top: 12px; }
+.import-preview table { min-width: 620px; }
+.import-preview select { max-width: 260px; padding: 6px; font-size: 9px; }
+.review-history { margin: 8px 0 0; padding-left: 22px; color: #69766e; font-size: 10px; }
+.review-history li { margin: 8px 0; }
+.review-history span, .review-history small { display: block; margin-top: 3px; overflow-wrap: anywhere; }
 .document-text { max-height: 45vh; overflow: auto; margin: 15px 0 0; border: 1px solid #edf0ed; border-radius: 5px; padding: 13px; color: #536158; background: #f9fbf9; font: 10px/1.7 'Segoe UI', sans-serif; white-space: pre-wrap; }
 .original-value, .reviewer-notes { margin: 10px 0; border-left: 2px solid #d7b66d; padding: 8px 11px; color: #6c6048; background: #fbf8ef; font-size: 10px; line-height: 1.6; white-space: pre-wrap; }
 .original-value strong, .original-value span { display: block; }
@@ -210,6 +220,7 @@ tbody tr:hover { background: #fbfcfb; }
   .profile-grid { grid-template-columns: 1fr; }
   .finding-meta { flex-wrap: wrap; }
   .finding-meta label { width: calc(50% - 6px); }
+  .mapping-list label { grid-template-columns: 1fr; gap: 4px; }
   .unavailable-form { flex-wrap: wrap; }
   .table-wrap table { min-width: 700px; }
   .topbar .breadcrumb { font-size: 9px; }

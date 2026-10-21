@@ -183,7 +183,7 @@ def main() -> int:
         return 1
 
     if args.json:
-        print(json.dumps(result, ensure_ascii=False))
+        print(json.dumps(result, ensure_ascii=True))
     else:
         print(f"CSR company research: {name}")
         print(f"Starting from: {website}")

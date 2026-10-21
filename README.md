@@ -36,6 +36,9 @@ Implemented functionality:
 - Deterministic CSR finding extraction and optional Gemini-based structuring.
 - Review actions to edit, approve, reject, or mark a finding/field unavailable.
 - Persisted, paginated research history and run-specific document/finding views.
+- CSV/XLS/XLSX imports with worksheet selection, editable header mapping, validation/duplicate preview, and explicit transactional confirmation into the same company registry.
+- Imported company candidates and CSR values retain row-level provenance; imported/extracted findings remain pending until human review.
+- Manually added companies require a confirmed official website and queue their initial research run from the web application.
 - Original extracted values retained when reviewers edit findings, plus CSV and print-friendly reports.
 
 Not implemented:
@@ -379,7 +382,7 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON csr_research.* TO 'csr_app'@'localhost';
 
 If this account already exists, do not blindly rerun `CREATE USER`; use the existing account or update its credential using MySQL’s supported account-management workflow. Put the account values in the root `.env` (`DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`). `database/seed.sql` is intentionally empty of fictitious companies and is not needed for setup.
 
-For an existing installation created with an older `schema.sql`, first make a database backup, then apply `database\migrations\001_research_run_history.sql` followed by `database\migrations\002_run_warning_summary.sql`, once each, using an administrator account or MySQL Workbench. The migrations add a backfilled original-value column, run association tables, and a warning-summary column; they do not drop or delete research records. Existing rows are retained. The old schema had overwritten edited finding values and reassigned deduplicated documents to their most recent run, so earlier original values/run associations that were already lost cannot be reconstructed by a migration. Do not run these migrations on a database initialized from the current `database/schema.sql`.
+For an existing installation created with an older `schema.sql`, first make a database backup, then apply `database\migrations\001_research_run_history.sql` through `database\migrations\004_company_contact_details.sql` once each in numeric order, using an administrator account or MySQL Workbench. These additive migrations retain existing records and domains; they do not drop company or research tables. The older schema had overwritten some edited finding values and reassigned deduplicated documents to their most recent run, so values/run associations lost before migration cannot be reconstructed. Do not run these migrations on a database initialized from the current `database/schema.sql`.
 
 ### 10. Verify configuration and dependencies
 
@@ -578,7 +581,11 @@ All API routes are prefixed with `/api`. Success response shapes below describe 
 | `GET /api/dashboard` | Dashboard totals and recent runs | None | Counts plus up to eight recent runs |
 | `GET /api/company-domain-suggestions?company_name=` | Suggest a registry URL for an exact company/alias match | Company name | `{ suggested_website, requires_confirmation }`; never confirms automatically |
 | `GET /api/companies?q=&industry=&research_status=&page=` | Filtered/paginated directory | Optional query parameters; 50 records/page | `companies`, `industries`, `pagination` |
-| `POST /api/companies` | Create company | JSON company fields | HTTP 201 `{ company }` |
+| `POST /api/companies` | Create company and queue initial research | Company fields and confirmed official website | HTTP 201 `{ company, research_run }` |
+| `GET /api/companies/matches?name=&cin=` | Find exact canonical name, alias, or CIN matches | Company name and optional CIN | `{ matches }` |
+| `POST /api/imports/scan` | Inspect an uploaded CSV/XLS/XLSX workbook | `application/octet-stream`, filename query | Worksheets, headers, sample rows, proposed mappings |
+| `POST /api/imports/preview` | Validate mapped rows and detect registry duplicates | Workbook bytes, filename/sheet query, `X-Import-Mappings` JSON header | Row previews and validation/duplicate outcomes; no writes |
+| `POST /api/imports/confirm` | Persist reviewed import in a transaction | Workbook bytes, filename/sheet, mappings and optional resolutions headers | HTTP 201 `{ import_batch }` |
 | `GET /api/companies/:id` | Company profile | Numeric ID | `{ company, research_runs, documents, findings }` |
 | `PATCH /api/companies/:id` | Edit company | JSON company fields | `{ company }` |
 | `DELETE /api/companies/:id` | Delete company and related DB history | Numeric ID | HTTP 204, no body |
@@ -591,8 +598,9 @@ All API routes are prefixed with `/api`. Success response shapes below describe 
 | `GET /api/companies/:id/findings` | List company findings | Numeric company ID | `{ findings }` |
 | `POST /api/companies/:id/findings` | Manually mark a field unavailable | `{ field_name }` | HTTP 201 `{ finding }` |
 | `PATCH /api/findings/:id/review` | Edit finding and review state | `review_status`; optional `finding_value`, `financial_year`, `reviewer_notes` | `{ finding }` |
+| `GET /api/findings/:id/history` | Reopen decisions and prior/revised finding values | Numeric finding ID | `{ history }` |
 
-IDs must be positive safe integers. Research statuses and finding review statuses are validated. A second active run for a company returns `409`. Company creation/edit errors include invalid input (`400`) and normalized-name duplicates (`409`); missing IDs return `404`. Database availability is required for data routes. To verify the API without modifying records, use `GET /api/health`; the bundled tests also exercise health and pre-database validation.
+IDs must be positive safe integers. Research statuses and finding review statuses are validated. A second active run for a company returns `409`. Company creation/edit errors include invalid input (`400`) and normalized-name duplicates (`409`); missing IDs return `404`. Import preview is read-only; only explicit confirmation writes. Database availability is required for import preview/matches and data routes. To verify the API without modifying records, use `GET /api/health`; the bundled tests also exercise health and pre-database validation.
 
 ## Research pipeline details
 
@@ -607,6 +615,10 @@ IDs must be positive safe integers. Research statuses and finding review statuse
 9. **Local findings:** Regex detects some Indian currency amounts and financial-year formats. Keyword/sentence rules produce CSR-related observations, focus areas, projects, committees, and partner findings. It does not do dedicated table parsing and can miss content.
 10. **Optional Gemini:** If `GEMINI_API_KEY` is configured and `google-genai` is installed, relevant passages may be sent for schema-constrained JSON structuring. The code checks fields, excerpt/value correspondence, source URL, year, and page evidence. Gemini is not required; errors/quota/malformed responses result in a warning while local findings remain.
 11. **Persistence and human review:** Node stores documents/findings with company/run IDs, source URLs, hashes, excerpts, years/pages, and extraction method. Run-link tables preserve run-specific document/finding membership despite cross-run deduplication. New automated findings start as `pending_review`; edits preserve the first extracted value and original excerpt.
+
+## Spreadsheet imports and data mapping
+
+The import dialog scans actual CSV/XLS/XLSX workbook headers before any database write. Users select a worksheet, edit proposed mappings, inspect validation and duplicate results, and confirm or skip rows. Imports use the canonical `companies` table, retain original row JSON and mappings in `import_batch_rows`, and never promote an imported website candidate to a confirmed domain. CSR values retain financial-year/source context and remain pending review; no source or evidence is fabricated. See [the field-mapping audit](docs/field-mapping.md). The Hinjewadi and Delhi NCR workbook files were not included in this repository, so their exact headers are not preconfigured.
 
 The Python JSON mode writes progress events followed by a result object. The Node bridge consumes those lines, ignores unrelated stdout diagnostics rather than confusing them with result JSON, enforces timeout/output limits, and passes the result to the database workflow. This operation depends on the configured Python executable and installed Python requirements.
 
@@ -733,7 +745,7 @@ Check:
 
 1. The MySQL service is running in `services.msc`.
 2. Root `.env` uses the correct host, port, database name, user, and password.
-3. `database/schema.sql` has been executed successfully for a new database, or both versioned migration files have been applied once to an older database.
+3. `database/schema.sql` has been executed successfully for a new database, or migrations `001_research_run_history.sql` through `004_company_contact_details.sql` have been applied once in numeric order to an older database.
 4. The configured app user has CRUD privileges on `csr_research.*`.
 5. No credential has trailing spaces or been added with mismatched quotes.
 

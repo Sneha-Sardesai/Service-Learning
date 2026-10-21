@@ -26,7 +26,7 @@ function getPool() {
       connectionLimit: 10,
       queueLimit: 0,
       charset: 'utf8mb4',
-      decimalNumbers: true,
+      decimalNumbers: false,
     });
   }
   return pool;
