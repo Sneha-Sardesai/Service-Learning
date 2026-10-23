@@ -9,7 +9,7 @@ const { parseMoney } = require('./money');
 async function createRun(companyId) {
   return transaction(async (connection) => {
     const [rows] = await connection.execute(
-      'SELECT official_website FROM companies WHERE id = ? FOR UPDATE',
+      'SELECT official_website, official_website_verified_at, company_name FROM companies WHERE id = ? FOR UPDATE',
       [companyId],
     );
     if (!rows.length) {
@@ -17,30 +17,36 @@ async function createRun(companyId) {
       error.status = 404;
       throw error;
     }
-    if (!rows[0].official_website) {
+    if (!rows[0].official_website || !rows[0].official_website_verified_at) {
       const error = new Error('Add and confirm the company official website before starting research.');
       error.status = 400;
       throw error;
     }
+    const confirmedWebsite = normalizeWebsite(rows[0].official_website);
     const [activeRuns] = await connection.execute(
-      'SELECT id FROM research_runs WHERE company_id = ? AND status IN ("queued", "running") LIMIT 1',
+      'SELECT id, status FROM research_runs WHERE company_id = ? AND status IN ("queued", "running") LIMIT 1',
       [companyId],
     );
     if (activeRuns.length) {
-      const error = new Error('Research is already in progress for this company.');
-      error.status = 409;
-      throw error;
+      return { id: activeRuns[0].id, companyId, website: confirmedWebsite,
+        companyName: rows[0].company_name, status: activeRuns[0].status, existing: true };
     }
     const [insert] = await connection.execute(
       `INSERT INTO research_runs (company_id, status, progress_message, confirmed_domain)
        VALUES (?, "queued", "Waiting to start", ?)`,
-      [companyId, rows[0].official_website],
+      [companyId, confirmedWebsite],
+    );
+    await connection.execute(
+      `INSERT INTO research_run_events (research_run_id, event_type, step, message, source_url)
+       VALUES (?, 'run_queued', 'queued', 'Waiting to start', ?)` ,
+      [insert.insertId, confirmedWebsite],
     );
     await connection.execute(
       'UPDATE companies SET research_status = "queued" WHERE id = ?',
       [companyId],
     );
-    return { id: insert.insertId, companyId, website: rows[0].official_website };
+    return { id: insert.insertId, companyId, website: confirmedWebsite,
+      companyName: rows[0].company_name, status: 'queued', existing: false };
   });
 }
 
@@ -62,18 +68,74 @@ async function recoverInterruptedRuns() {
 }
 
 async function updateProgress(runId, event) {
-  const step = event.step === 'processing_documents' ? 'Processing discovered documents' : 'Crawling confirmed company website';
-  await query(
-    `UPDATE research_runs
-     SET status = 'running', progress_message = ?, pages_visited = ?, documents_discovered = ?
-     WHERE id = ?`,
-    [
-      step,
-      Math.max(0, Number(event.pages_visited) || 0),
-      Math.max(0, Number(event.documents_discovered) || 0),
-      runId,
-    ],
-  );
+  const labels = {
+    crawling: 'Crawling confirmed company website',
+    processing_documents: 'Processing discovered documents',
+    extracting: 'Extracting CSR evidence',
+  };
+  const step = labels[event.step] || 'Research in progress';
+  let message = String(event.message || (
+    event.step === 'crawling' ? `Visited page ${Number(event.pages_visited) || 0}: ${event.current_url || ''}` : step
+  )).trim();
+  if (message.length > 1000) {
+    message = message.slice(0, 997) + '...';
+  }
+  try {
+    await query(
+      `UPDATE research_runs
+       SET status = IF(? = 'completed', status, 'running'), progress_message = ?, pages_visited = GREATEST(pages_visited, ?),
+           documents_discovered = GREATEST(documents_discovered, ?),
+           documents_processed = GREATEST(documents_processed, ?), findings_count = GREATEST(findings_count, ?)
+       WHERE id = ?`,
+      [
+        event.step,
+        message,
+        Math.max(0, Number(event.pages_visited) || 0),
+        Math.max(0, Number(event.documents_discovered) || 0),
+        Math.max(0, Number(event.documents_processed) || 0),
+        Math.max(0, Number(event.findings_count) || 0),
+        runId,
+      ],
+    );
+  } catch (error) {
+    console.error(`Could not update research progress message for run ${runId}: ${error.message}`);
+    try {
+      await query(
+        `UPDATE research_runs
+         SET status = IF(? = 'completed', status, 'running'), progress_message = 'Research in progress',
+             pages_visited = GREATEST(pages_visited, ?),
+             documents_discovered = GREATEST(documents_discovered, ?),
+             documents_processed = GREATEST(documents_processed, ?), findings_count = GREATEST(findings_count, ?)
+         WHERE id = ?`,
+        [
+          event.step,
+          Math.max(0, Number(event.pages_visited) || 0),
+          Math.max(0, Number(event.documents_discovered) || 0),
+          Math.max(0, Number(event.documents_processed) || 0),
+          Math.max(0, Number(event.findings_count) || 0),
+          runId,
+        ],
+      );
+    } catch {
+      // Best effort fallback
+    }
+    throw error;
+  }
+  const details = { ...event };
+  delete details.current_url;
+  delete details.message;
+  try {
+    await query(
+      `INSERT INTO research_run_events (research_run_id, event_type, step, message, source_url, details)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [runId, String(event.event_type || event.step || 'progress').slice(0, 60),
+        String(event.step || 'research').slice(0, 40), message,
+        event.current_url ? String(event.current_url).slice(0, 2048) : null,
+        JSON.stringify(details)],
+    );
+  } catch (eventError) {
+    console.error(`Could not record progress event for run ${runId}: ${eventError.message}`);
+  }
 }
 
 function evidenceHash(finding) {
@@ -108,14 +170,16 @@ async function saveResearchResult(companyId, runId, result) {
             : /csr policy/i.test(title) ? 'csr_policy'
               : null
       );
+      const linkText = document.link_text ? String(document.link_text).slice(0, 1000) : null;
       await connection.execute(
         `INSERT INTO documents
-          (company_id, research_run_id, source_url, url_hash, title, file_type, document_type,
+          (company_id, research_run_id, source_url, source_page_url, link_text, url_hash, title, file_type, document_type,
            financial_year, publication_date, content_hash,
-           storage_name, extracted_text, processing_status, processing_error, downloaded_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           storage_name, extracted_text, processing_status, processing_error, validation_result, downloaded_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON DUPLICATE KEY UPDATE
            title = VALUES(title),
+           link_text = COALESCE(VALUES(link_text), link_text),
            file_type = VALUES(file_type),
            document_type = COALESCE(VALUES(document_type), document_type),
            financial_year = COALESCE(VALUES(financial_year), financial_year),
@@ -125,11 +189,15 @@ async function saveResearchResult(companyId, runId, result) {
            extracted_text = VALUES(extracted_text),
            processing_status = VALUES(processing_status),
            processing_error = VALUES(processing_error),
+           source_page_url = COALESCE(VALUES(source_page_url), source_page_url),
+           validation_result = VALUES(validation_result),
            downloaded_at = COALESCE(VALUES(downloaded_at), downloaded_at)`,
         [
           companyId,
           runId,
           document.url,
+          document.source_page_url || null,
+          linkText,
           urlHash,
           title,
           document.file_type || 'unknown',
@@ -138,10 +206,11 @@ async function saveResearchResult(companyId, runId, result) {
           document.publication_date || null,
           document.content_hash || null,
           document.storage_name || null,
-          document.text || null,
+          document.extracted_text || null,
           document.status || 'discovered',
           document.error || null,
-          document.content_hash ? new Date() : null,
+          document.validation_result || null,
+          document.status === 'processed' ? new Date() : null,
         ],
       );
       const [rows] = await connection.execute(
@@ -206,25 +275,54 @@ async function saveResearchResult(companyId, runId, result) {
       ? result.status
       : 'partially_completed';
     const summary = errors.length ? errors.slice(0, 30).join('\n').slice(0, 10000) : null;
-    await connection.execute(
-      `UPDATE research_runs
-       SET status = ?, progress_message = ?, pages_visited = ?, documents_discovered = ?,
-           documents_processed = ?, findings_count = ?, error_summary = ?,
-           warning_summary = ?, summary = ?, completed_at = NOW()
-       WHERE id = ?`,
-      [
-        status,
-        status === 'completed' ? 'Research completed; findings await human review' : `Research ${status.replace('_', ' ')}`,
-        Number(result.pages_visited) || 0,
-        counts.documentsDiscovered,
-        counts.documentsProcessed,
-        counts.findings.length,
-        summary,
-        warnings.slice(0, 30).join('\n').slice(0, 10000) || null,
-        `${counts.documentsProcessed} documents processed; ${counts.findings.length} findings retained for human review.`,
-        runId,
-      ],
-    );
+    const progressMessage = String(
+      result.summary || (status === 'completed'
+        ? 'Report discovery completed; document contents have not been reviewed.'
+        : `Research ${status.replace('_', ' ')}`)
+    ).trim().slice(0, 2000);
+    try {
+      await connection.execute(
+        `UPDATE research_runs
+         SET status = ?, progress_message = ?, pages_visited = ?, documents_discovered = ?,
+             documents_processed = ?, findings_count = ?, error_summary = ?,
+             warning_summary = ?, summary = ?, completed_at = NOW()
+         WHERE id = ?`,
+        [
+          status,
+          progressMessage,
+          Number(result.pages_visited) || 0,
+          counts.documentsDiscovered,
+          counts.documentsProcessed,
+          counts.findings.length,
+          summary,
+          warnings.slice(0, 30).join('\n').slice(0, 10000) || null,
+          result.summary || `${counts.documentsProcessed} valid reports saved; report contents have not been reviewed.`,
+          runId,
+        ],
+      );
+    } catch (saveError) {
+      console.error(`Could not save research result summary for run ${runId}: ${saveError.message}`);
+      warnings.push(`Progress storage notice: ${saveError.message}`);
+      await connection.execute(
+        `UPDATE research_runs
+         SET status = ?, progress_message = ?, pages_visited = ?, documents_discovered = ?,
+             documents_processed = ?, findings_count = ?, error_summary = ?,
+             warning_summary = ?, summary = ?, completed_at = NOW()
+         WHERE id = ?`,
+        [
+          status,
+          `Research ${status.replace('_', ' ')}`,
+          Number(result.pages_visited) || 0,
+          counts.documentsDiscovered,
+          counts.documentsProcessed,
+          counts.findings.length,
+          summary,
+          warnings.slice(0, 30).join('\n').slice(0, 10000) || null,
+          `Research ${status.replace('_', ' ')}`,
+          runId,
+        ],
+      );
+    }
     await connection.execute(
       'UPDATE companies SET research_status = ?, last_researched_at = NOW() WHERE id = ?',
       [status, companyId],
@@ -234,8 +332,8 @@ async function saveResearchResult(companyId, runId, result) {
 }
 
 async function executeResearchRun(run, onProgress = () => {}) {
-  let lastWrite = 0;
   let progressQueue = Promise.resolve();
+  let progressUpdateWarning = null;
   try {
     await transaction(async (connection) => {
       await connection.execute(
@@ -247,23 +345,34 @@ async function executeResearchRun(run, onProgress = () => {}) {
         'UPDATE companies SET research_status = "running" WHERE id = ?',
         [run.companyId],
       );
+      await connection.execute(
+        `INSERT INTO research_run_events (research_run_id, event_type, step, message, source_url)
+         VALUES (?, 'run_started', 'running', 'Opening the confirmed official website', ?)` ,
+        [run.id, run.website],
+      );
     });
     const result = await runResearch(run.companyName, run.website, {
       onProgress(event) {
         onProgress(event);
-        if (event.step === 'processing_documents' || (event.pages_visited || 0) % 5 === 0) {
-          const now = Date.now();
-          if (now - lastWrite > 1000) {
-            lastWrite = now;
-            progressQueue = progressQueue.then(() => updateProgress(run.id, event)).catch((error) => {
-              console.error(`Could not update research progress for run ${run.id}: ${error.message}`);
-            });
-          }
-        }
+        progressQueue = progressQueue.then(() => updateProgress(run.id, event)).catch((error) => {
+          console.error(`Could not update research progress for run ${run.id}: ${error.message}`);
+          progressUpdateWarning = `Progress update notice: ${error.message}`;
+        });
       },
     });
     await progressQueue;
-    return await saveResearchResult(run.companyId, run.id, result);
+    if (progressUpdateWarning) {
+      result.warnings = result.warnings || [];
+      result.warnings.push(progressUpdateWarning);
+    }
+    const saved = await saveResearchResult(run.companyId, run.id, result);
+    try {
+      await updateProgress(run.id, { step: 'completed', event_type: 'run_completed',
+        message: `Research ${saved.status.replaceAll('_', ' ')}; ${saved.documents_processed || 0} documents processed and ${saved.findings?.length || 0} findings saved for review` });
+    } catch (error) {
+      console.error(`Could not record completion event for run ${run.id}: ${error.message}`);
+    }
+    return saved;
   } catch (error) {
     try {
       await transaction(async (connection) => {
@@ -271,6 +380,11 @@ async function executeResearchRun(run, onProgress = () => {}) {
           `UPDATE research_runs SET status = 'failed', progress_message = 'Research failed',
             error_summary = ?, completed_at = NOW() WHERE id = ?`,
           [String(error.message || 'Research failed').slice(0, 10000), run.id],
+        );
+        await connection.execute(
+          `INSERT INTO research_run_events (research_run_id, event_type, step, message)
+           VALUES (?, 'run_failed', 'failed', ?)`,
+          [run.id, String(error.message || 'Research failed').slice(0, 1000)],
         );
         await connection.execute(
           'UPDATE companies SET research_status = "failed", last_researched_at = NOW() WHERE id = ?',

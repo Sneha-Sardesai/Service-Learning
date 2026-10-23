@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from typing import Callable
 from pathlib import Path
 
 FINANCIAL_YEAR = re.compile(r"\b(?:FY\s*)?(20\d{2}\s*[-–]\s*(?:20)?\d{2})\b", re.IGNORECASE)
@@ -15,8 +16,8 @@ MONEY = re.compile(
 RELEVANT_TERMS = (
     "corporate social responsibility", "csr committee", "csr expenditure",
     "csr spend", "csr obligation", "unspent csr", "csr policy",
-    "csr focus area", "csr project", "csr initiative", "implementation partner",
-    "implementing partner", "sustainability", "social impact", "community development",
+    "csr focus area", "csr project", "csr initiative", "csr budget",
+    "implementation partner", "implementing partner",
 )
 
 
@@ -26,9 +27,10 @@ def _excerpt_for(text: str, start: int, end: int, width: int = 360) -> str:
     return re.sub(r"\s+", " ", text[left:right]).strip()
 
 
-def extract_findings(documents: list[dict]) -> list[dict]:
+def extract_findings(documents: list[dict], progress: Callable[[dict], None] | None = None) -> list[dict]:
     findings: list[dict] = []
     for document in documents:
+        before = len(findings)
         for page in document.get("pages") or [{"page": None, "text": document.get("text", "")}]:
             text = page.get("text") or ""
             sentences = re.split(r"(?<!Rs\.)(?<=[.!?])\s+|\n+", text, flags=re.IGNORECASE)
@@ -40,10 +42,25 @@ def extract_findings(documents: list[dict]) -> list[dict]:
                 year = re.sub(r"\s+", "", year_match.group(1)) if year_match else None
                 amount_match = MONEY.search(sentence)
                 if amount_match:
-                    if "unspent" in lowered and "csr" in lowered:
+                    csr_amount_context = any(term in lowered for term in (
+                        "obligation", "required to spend", "expenditure", "spent", "unspent", "budget",
+                    )) and "csr" in lowered
+                    company_amount_context = any(term in lowered for term in ("turnover", "revenue", "sales"))
+                    ambiguous_amount_context = csr_amount_context and company_amount_context
+                    if ambiguous_amount_context:
+                        field_name = None
+                    elif "unspent" in lowered and "csr" in lowered:
                         field_name = "unspent_csr_amount"
                     elif ("obligation" in lowered or "required to spend" in lowered) and "csr" in lowered:
                         field_name = "csr_obligation_amount"
+                    elif "budget" in lowered and "csr" in lowered:
+                        field_name = "csr_budget_amount"
+                    elif "turnover" in lowered:
+                        field_name = "turnover_amount"
+                    elif "revenue" in lowered:
+                        field_name = "revenue_amount"
+                    elif "sales" in lowered:
+                        field_name = "sales_amount"
                     elif ("expenditure" in lowered or "spent" in lowered) and "csr" in lowered:
                         field_name = "csr_expenditure_amount"
                     else:
@@ -60,6 +77,8 @@ def extract_findings(documents: list[dict]) -> list[dict]:
                             "extraction_method": "pattern",
                             "review_status": "pending_review",
                         })
+                # Avoid turning general ESG, sustainability, or incidental mentions
+                # into database claims. Keep only sentences that identify a CSR fact.
                 if any(term in lowered for term in RELEVANT_TERMS):
                     if "committee" in lowered:
                         field_name = "csr_committee"
@@ -67,13 +86,17 @@ def extract_findings(documents: list[dict]) -> list[dict]:
                         field_name = "csr_implementation_partner"
                     elif "focus area" in lowered or "focus areas" in lowered:
                         field_name = "csr_focus_area"
+                    elif "policy" in lowered:
+                        field_name = "csr_policy_reference"
                     elif (
                         any(term in lowered for term in ("project", "initiative", "programme", "program"))
                         and any(term in lowered for term in ("csr", "social", "community"))
                     ):
                         field_name = "csr_project"
+                    elif "budget" in lowered and not amount_match:
+                        field_name = "csr_budget_amount"
                     else:
-                        field_name = "csr_observation"
+                        continue
                     findings.append({
                         "field_name": field_name,
                         "value": sentence.strip()[:1000],
@@ -85,6 +108,12 @@ def extract_findings(documents: list[dict]) -> list[dict]:
                         "extraction_method": "keyword",
                         "review_status": "pending_review",
                     })
+        if progress:
+            progress({"step": "extracting", "event_type": "document_extracted",
+                      "title": document.get("title") or document.get("url"),
+                      "current_url": document.get("url"),
+                      "document_findings": len(findings) - before,
+                      "message": f"Scanned {document.get('title') or document.get('url')}; found {len(findings) - before} candidate evidence items"})
     unique: dict[tuple, dict] = {}
     for item in findings:
         key = (item["field_name"], item["value"], item["source_url"], item["page_number"])
@@ -97,7 +126,11 @@ MODEL_FIELDS = {
     "csr_project",
     "csr_implementation_partner",
     "csr_committee",
-    "csr_observation",
+    "csr_budget_amount",
+    "csr_policy_reference",
+    "turnover_amount",
+    "revenue_amount",
+    "sales_amount",
     "csr_policy_url",
     "annual_report_url",
     "brsr_url",

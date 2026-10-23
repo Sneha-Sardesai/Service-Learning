@@ -8,6 +8,7 @@ import os
 import re
 import tempfile
 import time
+from typing import Callable
 from pathlib import Path
 
 from pypdf import PdfReader
@@ -61,7 +62,13 @@ def _extract(path: Path, file_type: str) -> tuple[str, list[dict], str | None]:
     from bs4 import BeautifulSoup
 
     content = path.read_bytes()
-    text = " ".join(BeautifulSoup(content, "html.parser").stripped_strings)
+    soup = BeautifulSoup(content, "html.parser")
+    for chrome in soup.find_all((
+        "nav", "header", "footer", "script", "style", "noscript", "aside", "form"
+    )):
+        chrome.decompose()
+    main = soup.find("main") or soup.find("article") or soup.body or soup
+    text = " ".join(main.stripped_strings)
     return text, [], None if text else "HTML page contained no extractable text."
 
 
@@ -91,6 +98,7 @@ def process_documents(
     company_name: str,
     *,
     storage: Path | None = None,
+    progress: Callable[[dict], None] | None = None,
 ) -> tuple[list[dict], list[str]]:
     base = storage or DEFAULT_STORAGE
     company_dir = base / hashlib.sha256(company_name.casefold().encode("utf-8")).hexdigest()[:16]
@@ -153,6 +161,9 @@ def process_documents(
             "error": None,
         }
         response = None
+        if progress:
+            progress({"step": "processing_documents", "event_type": "document_started",
+                      "title": record["title"], "current_url": item["url"]})
         try:
             unsupported = is_cached_unsupported(item["url"]) if CACHE_TTL_SECONDS else None
             if unsupported:
@@ -260,4 +271,9 @@ def process_documents(
             if response is not None:
                 response.close()
         output.append(record)
+        if progress:
+            progress({"step": "processing_documents", "event_type": "document_processed",
+                      "title": record["title"], "current_url": item["url"],
+                      "processing_status": record["status"], "documents_processed": len(output),
+                      "message": f"{record['status']}: {record['title']}"})
     return output, errors

@@ -11,8 +11,7 @@ from pathlib import Path
 from typing import Callable
 
 from crawler import OfficialSiteCrawler, UnsafeUrlError
-from document_extractor import process_documents, save_page
-from information_extractor import extract_findings, extract_with_gemini
+from report_discovery import discover_reports
 
 DOMAIN_FILE = Path(__file__).with_name("company_domains.json")
 
@@ -56,8 +55,9 @@ def run_research(
     company_name: str,
     website: str,
     *,
-    max_pages: int = 40,
-    max_depth: int = 3,
+    max_pages: int = 80,
+    max_depth: int = 4,
+    max_duration_seconds: int = 900,
     progress: Callable[[dict], None] | None = None,
 ) -> dict:
     crawler = OfficialSiteCrawler(
@@ -65,65 +65,84 @@ def run_research(
         max_pages=max_pages,
         max_depth=max_depth,
         timeout=int(os.getenv("CRAWL_TIMEOUT_SECONDS", "15")),
+        max_duration_seconds=max_duration_seconds,
         max_bytes=int(os.getenv("MAX_HTML_BYTES", str(3_000_000))),
         user_agent=os.getenv(
             "CRAWL_USER_AGENT",
             "ServiceLearningCSRResearcher/1.0 (educational research)",
         ),
     )
-    result = crawler.crawl(progress=progress)
     if progress:
-        progress({
-            "step": "processing_documents",
-            "pages_visited": result["pages_visited"],
-            "documents_discovered": len(result["documents"]),
-        })
-    processed, download_errors = process_documents(crawler, result["documents"], company_name)
-    relevant_pages = []
-    for page in result["pages"]:
-        if page["relevance"] <= 0:
-            continue
-        saved_page = save_page(page, company_name)
-        relevant_pages.append({
-            "url": page["url"],
-            "title": page["title"],
-            "file_type": "text/html",
-            "status": "processed" if page["text"] else "empty",
-            "content_hash": saved_page["content_hash"],
-            "storage_name": saved_page["storage_name"],
-            "text": page["text"],
-            "pages": [],
-            "error": None,
-        })
-    documents = relevant_pages + processed
-    findings = extract_findings(documents)
+        progress({"step": "opening_website", "event_type": "website_opening", "message": f"Opening the confirmed official website: {crawler.website}"})
+    result = crawler.crawl(progress=progress)
+    documents, download_errors = discover_reports(crawler, result["documents"], company_name, progress=progress)
     errors = result["errors"] + download_errors
-    model_findings, model_warning = extract_with_gemini(documents)
-    finding_keys = {
-        (item["field_name"], item["value"], item["source_url"], item["page_number"])
-        for item in findings
-    }
-    for finding in model_findings:
-        key = (finding["field_name"], finding["value"], finding["source_url"], finding["page_number"])
-        if key not in finding_keys:
-            findings.append(finding)
-            finding_keys.add(key)
     warnings = list(result["warnings"])
-    if model_warning:
-        warnings.append(model_warning)
-    status = "completed" if not errors else ("partially_completed" if documents else "failed")
+    stop_reason = result.get("stop_reason", "completed")
+    sitemaps_checked = result.get("sitemaps_checked", [])
+    pages_visited_urls = result.get("pages_visited_urls", [])
+    relevant_pages_found = result.get("relevant_pages_found", sum(page.get("relevance", 0) > 0 for page in result.get("pages", [])))
+    if any(item.get("error") == "Per-run report limit reached." for item in documents):
+        warnings.append("Per-run report limit reached; remaining report candidates were recorded as skipped.")
+    blocked_count = len(result.get("blocked_external_candidates", []))
+    if blocked_count:
+        warnings.append(f"{blocked_count} candidate link(s) were left blocked because their host is not approved.")
+    valid_documents = sum(item["status"] == "processed" for item in documents)
+    partial_stops = {"page_limit", "depth_limit", "duration_limit"}
+    status = "completed" if not errors and not warnings else (
+        "partially_completed" if result["pages"] or valid_documents else "failed"
+    )
+    if stop_reason in partial_stops:
+        status = "partially_completed"
+    if stop_reason == "no_relevant_material" and not errors:
+        status = "completed"
+    blocked_summary = f" {blocked_count} candidate link(s) were left blocked because their host is not approved." if blocked_count else ""
+    crawl_totals = (
+        f"{result['pages_visited']} pages visited; {len(sitemaps_checked)} sitemap(s) checked; "
+        f"{relevant_pages_found} relevant page(s); {len(documents)} report candidate(s); "
+        f"{valid_documents} validated report(s) saved; {len(errors)} error(s); stop reason: {stop_reason}."
+    )
+    if status == "completed":
+        if stop_reason == "no_relevant_material":
+            summary = f"No relevant CSR or reporting material was found. {crawl_totals}{blocked_summary}"
+        else:
+            summary = f"Report discovery completed. {crawl_totals}{blocked_summary} Contents have not been reviewed."
+    elif status == "partially_completed":
+        summary = f"Report discovery is incomplete. {crawl_totals}{blocked_summary} Next action: increase the indicated crawl budget, fix failed URLs, or review blocked hosts before retrying. Contents have not been reviewed."
+    else:
+        summary = f"Report discovery could not complete meaningful work. {crawl_totals}{blocked_summary}"
+    if progress:
+        progress({"step": "finished", "event_type": "crawl_finished", "pages_visited": result["pages_visited"],
+                  "documents_discovered": len(documents), "documents_processed": valid_documents,
+                  "stop_reason": stop_reason, "relevant_pages_found": relevant_pages_found,
+                  "sitemaps_checked": sitemaps_checked,
+                  "pages_visited_urls": pages_visited_urls,
+                  "candidate_documents_found": len(documents),
+                  "errors": [str(error)[:1000] for error in errors[:30]],
+                  "blocked_external_candidates": result.get("blocked_external_candidates", []),
+                  "errors_count": len(errors),
+                  "message": f"Report discovery finished: {valid_documents} validated reports saved from {len(documents)} candidates; {relevant_pages_found} relevant pages, {len(sitemaps_checked)} sitemaps checked; stop reason: {stop_reason}."})
     return {
         "company_name": company_name,
         "official_website": crawler.website,
         "status": status,
         "pages_visited": result["pages_visited"],
-        "documents_discovered": len(result["documents"]) + len(relevant_pages),
-        "documents_processed": sum(item["status"] == "processed" for item in documents),
+        "pages_visited_urls": pages_visited_urls,
+        "sitemaps_checked": sitemaps_checked,
+        "relevant_pages_found": relevant_pages_found,
+        "candidate_documents_found": len(documents),
+        "blocked_external_candidates": result.get("blocked_external_candidates", []),
+        "skipped_links": result.get("skipped_links", []),
+        "stop_reason": stop_reason,
+        "duration_seconds": result.get("duration_seconds", 0),
+        "documents_discovered": len(documents),
+        "documents_processed": valid_documents,
         "documents": documents,
-        "findings": findings,
+        "findings": [],
         "errors": errors,
         "warnings": warnings,
-        "extraction_status": "pending_review" if findings else "no_findings",
+        "summary": summary,
+        "extraction_status": "not_started",
     }
 
 
@@ -136,8 +155,9 @@ def main() -> int:
         "--website",
         help="Confirmed official website URL; required when no registry entry exists",
     )
-    parser.add_argument("--max-pages", type=int, default=int(os.getenv("MAX_CRAWL_PAGES", "40")))
-    parser.add_argument("--max-depth", type=int, default=int(os.getenv("MAX_CRAWL_DEPTH", "3")))
+    parser.add_argument("--max-pages", type=int, default=int(os.getenv("MAX_CRAWL_PAGES", "80")))
+    parser.add_argument("--max-depth", type=int, default=int(os.getenv("MAX_CRAWL_DEPTH", "4")))
+    parser.add_argument("--max-duration-seconds", type=int, default=int(os.getenv("CRAWL_MAX_DURATION_SECONDS", "900")))
     parser.add_argument("--json", action="store_true", help="Output machine-readable research results")
     args = parser.parse_args()
     name = " ".join(args.company).strip()
@@ -147,6 +167,8 @@ def main() -> int:
         parser.error("--max-pages must be between 1 and 200")
     if not 0 <= args.max_depth <= 8:
         parser.error("--max-depth must be between 0 and 8")
+    if not 10 <= args.max_duration_seconds <= 1800:
+        parser.error("--max-duration-seconds must be between 10 and 1800")
     try:
         website = resolve_website(name, args.website)
         if not website:
@@ -164,6 +186,7 @@ def main() -> int:
             website,
             max_pages=args.max_pages,
             max_depth=args.max_depth,
+            max_duration_seconds=args.max_duration_seconds,
             progress=(
                 (lambda event: print(json.dumps({"event": "progress", **event}), flush=True))
                 if args.json else None

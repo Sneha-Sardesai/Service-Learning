@@ -70,7 +70,7 @@ test('real workbook contact, location, priority, and themes headers are suggeste
     'CSR Email Link': 'contact_email',
     'Priority Tier': 'priority',
     'Primary CSR Themes': 'csr_focus_area',
-    Turnover: '',
+    Turnover: 'turnover_amount',
   });
 });
 
@@ -95,4 +95,7 @@ test('CSR monetary values preserve decimal precision, currency, and units', () =
   });
   assert.equal(parseMoney('₹ 0 lakh').numeric, '0');
   assert.equal(parseMoney('99.12345').numeric, null);
+  assert.deepEqual(parseMoney('INR 2,000+ crore'), {
+    numeric: '2000', currency: 'INR', unit: 'crore',
+  });
 });

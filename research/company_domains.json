@@ -3,5 +3,71 @@
     "website": "https://www.tatamotors.com/",
     "aliases": ["Tata Motors Limited", "Tata Motors Ltd"],
     "verification_note": "Sample starting domain; the researcher must confirm this is the correct official site before relying on findings."
+  },
+  "Apollo Hospitals": {
+    "website": "https://www.apollohospitals.com/",
+    "aliases": ["Apollo Hospitals Limited", "Indraprastha Apollo Hospitals"],
+    "source_url": "https://www.apollohospitals.com/Annual_General_Meeting_2026",
+    "verification_note": "Official investor page lists Apollo Hospitals annual reports and BRSR. Confirm that this parent-company domain matches the Delhi NCR registry entry before saving."
+  },
+  "BSES Rajdhani Power": {
+    "website": "https://www.bsesdelhi.com/",
+    "aliases": ["BSES Rajdhani Power Limited", "BRPL"],
+    "source_url": "https://www.bsesdelhi.com/web/brpl/companies-act-compliances",
+    "verification_note": "Official BRPL compliance page lists CSR policies, annual reports, and CSR disclosures."
+  },
+  "Dabur India": {
+    "website": "https://www.dabur.com/",
+    "aliases": ["Dabur India Limited", "Dabur"],
+    "source_url": "https://www.dabur.com/investors/financial-information/reports",
+    "verification_note": "Official Dabur reports page lists annual reports, business responsibility reports, CSR reports, and impact reports."
+  },
+  "DLF": {
+    "website": "https://www.dlf.in/",
+    "aliases": ["DLF Limited"],
+    "source_url": "https://www.dlf.in/investor",
+    "verification_note": "Official investor page lists CSR annual action plans and company disclosures."
+  },
+  "Fortis Healthcare": {
+    "website": "https://www.fortishealthcare.com/",
+    "aliases": ["Fortis Healthcare Limited"],
+    "source_url": "https://www.fortishealthcare.com/investors",
+    "verification_note": "Official investor page lists CSR policies, annual action plans, and annual reports."
+  },
+  "BEL Delhi": {
+    "website": "https://bel-india.in/",
+    "aliases": ["Bharat Electronics Limited", "BEL"],
+    "source_url": "https://bel-india.in/investors/",
+    "verification_note": "Official BEL investor page lists integrated annual reports. Confirm the Delhi registry entry is this company before saving."
+  },
+  "Tata Power-DDL": {
+    "website": "https://www.tatapower-ddl.com/",
+    "aliases": ["Tata Power Delhi Distribution Limited", "TPDDL"],
+    "source_url": "https://www.tatapower-ddl.com/csr/important-lists",
+    "verification_note": "Official Tata Power-DDL page lists CSR policy, committee, annual action plans, and impact assessments."
+  },
+  "Power Grid": {
+    "website": "https://www.powergrid.in/",
+    "aliases": ["Power Grid Corporation of India", "Power Grid Corporation of India Limited", "POWERGRID"],
+    "source_url": "https://www.powergrid.in/en/csr-annual-booklet",
+    "verification_note": "Official POWERGRID site publishes CSR booklets and annual reports."
+  },
+  "RITES": {
+    "website": "https://www.rites.com/",
+    "aliases": ["RITES Limited"],
+    "source_url": "https://www.rites.com/CSRRITES",
+    "verification_note": "Official RITES CSR page lists approved projects by financial year and company contact details."
+  },
+  "Engineers India": {
+    "website": "https://engineersindia.com/",
+    "aliases": ["Engineers India Limited", "EIL"],
+    "source_url": "https://engineersindia.com/corporate-social-responsibility",
+    "verification_note": "Official Engineers India CSR page identifies EIL and publishes CSR budgets, expenditure, policy, and approved projects."
+  },
+  "Relaxo Footwears": {
+    "website": "https://relaxofootwear.com/",
+    "aliases": ["Relaxo Footwears Limited", "Relaxo"],
+    "source_url": "https://relaxofootwear.com/pages/social-responsibility",
+    "verification_note": "Official Relaxo page identifies Relaxo Footwears Limited and describes its CSR initiatives."
   }
 }

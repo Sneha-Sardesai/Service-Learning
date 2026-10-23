@@ -13,13 +13,14 @@ const {
 } = require('./database');
 const {
   createRun,
-  executeResearchRun,
   findOrCreateCompany,
   recoverInterruptedRuns,
 } = require('./researchWorkflow');
 const { normalizeCompanyName, normalizeWebsite, validateCompanyName } = require('./validation');
 const { importFields, parseSpreadsheet, suggestMappings } = require('./spreadsheetImport');
 const { reviewedMoneyFields } = require('./money');
+const { enqueueResearch } = require('./researchQueue');
+const { buildSearch } = require('./companySearch');
 
 const app = express();
 const port = Number(process.env.PORT || 5000);
@@ -34,6 +35,9 @@ const importFindingFields = new Set([
   'csr_obligation_amount',
   'csr_expenditure_amount',
   'unspent_csr_amount',
+  'turnover_amount',
+  'revenue_amount',
+  'sales_amount',
   'csr_focus_area',
   'csr_project',
   'csr_implementation_partner',
@@ -200,7 +204,6 @@ function companyInput(body, existing = {}) {
   const contactDesignation = body.contact_designation === undefined
     ? existing.contact_designation
     : body.contact_designation;
-  const priority = body.priority === undefined ? existing.priority : body.priority;
   const notes = body.notes === undefined ? existing.notes : body.notes;
   const websiteInput = body.official_website === undefined
     ? existing.official_website
@@ -226,7 +229,7 @@ function companyInput(body, existing = {}) {
   for (const [value, label, max] of [
     [cin, 'CIN', 21], [city, 'City', 160], [contactEmail, 'Contact email', 254],
     [contactPhone, 'Contact phone', 40], [contactName, 'Contact name', 200],
-    [contactDesignation, 'Contact designation', 160], [priority, 'Priority', 80],
+    [contactDesignation, 'Contact designation', 160],
   ]) {
     if (value !== null && value !== undefined && (typeof value !== 'string' || value.length > max)) {
       const error = new Error(`${label} must be text of ${max} characters or fewer.`);
@@ -244,7 +247,6 @@ function companyInput(body, existing = {}) {
     contactPhone: typeof contactPhone === 'string' ? contactPhone.trim() || null : null,
     contactName: typeof contactName === 'string' ? contactName.trim() || null : null,
     contactDesignation: typeof contactDesignation === 'string' ? contactDesignation.trim() || null : null,
-    priority: typeof priority === 'string' ? priority.trim() || null : null,
     notes: typeof notes === 'string' ? notes.trim() || null : null,
     website,
   };
@@ -278,7 +280,7 @@ app.get('/api/health', async (_request, response) => {
     await query('SELECT provenance, numeric_value FROM findings LIMIT 0');
     await query('SELECT cin, website_candidate, official_website_verified_at FROM companies LIMIT 0');
     await query('SELECT contact_name, contact_designation FROM companies LIMIT 0');
-    await query('SELECT document_type, publication_date FROM documents LIMIT 0');
+    await query('SELECT document_type, publication_date, link_text FROM documents LIMIT 0');
     await query('SELECT 1 FROM finding_review_history LIMIT 0');
     await query('SELECT 1 FROM company_aliases LIMIT 0');
     response.json({ status: 'ok', database: 'available' });
@@ -321,51 +323,179 @@ app.get('/api/dashboard', async (_request, response) => {
   response.json({ ...rows[0], recent_runs: recentRuns });
 });
 
+app.get('/api/companies/options', async (_request, response) => {
+  const [industries, locations, focusAreas, turnoverBases] = await Promise.all([
+    query('SELECT DISTINCT industry AS value FROM companies WHERE industry IS NOT NULL AND industry <> "" ORDER BY industry'),
+    // Build suggestions from the supplied Indian workbooks. HQ cells include
+    // international headquarters; only their explicitly Indian entries belong
+    // in this location picker. City and Area are sourced from the Delhi/Chennai
+    // sheets and retain their original locality detail.
+    query(`SELECT DISTINCT original_value AS value FROM company_source_values
+      WHERE source_column IN ('City', 'Area') AND TRIM(original_value) <> ''
+      UNION
+      SELECT DISTINCT original_value AS value FROM company_source_values
+      WHERE source_column = 'HQ' AND original_value LIKE '%India%'
+      ORDER BY value`),
+    query('SELECT MIN(focus_area) AS value FROM company_focus_areas GROUP BY normalized_focus_area ORDER BY value'),
+    query(`SELECT DISTINCT
+        COALESCE(turnover_currency, CASE WHEN UPPER(COALESCE(turnover_original, "")) LIKE '%INR%'
+          OR UPPER(COALESCE(turnover_original, "")) LIKE '%RS%'
+          OR COALESCE(turnover_original, "") LIKE '%₹%' THEN 'INR' ELSE NULL END) AS turnover_currency,
+        COALESCE(turnover_unit, CASE WHEN LOWER(COALESCE(turnover_original, "")) LIKE '%crore%'
+          OR LOWER(COALESCE(turnover_original, "")) LIKE '% cr%' THEN 'crore'
+          WHEN LOWER(COALESCE(turnover_original, "")) LIKE '%lakh%' THEN 'lakh'
+          WHEN LOWER(COALESCE(turnover_original, "")) LIKE '%million%'
+          OR LOWER(COALESCE(turnover_original, "")) LIKE '% mn%' THEN 'million'
+          WHEN LOWER(COALESCE(turnover_original, "")) LIKE '%billion%' THEN 'billion' ELSE NULL END) AS turnover_unit
+      FROM companies WHERE turnover_amount IS NOT NULL
+      HAVING turnover_currency IS NOT NULL AND turnover_unit IS NOT NULL
+      ORDER BY turnover_currency, turnover_unit`),
+  ]);
+  response.json({
+    industries: industries.map((row) => row.value),
+    locations: locations.map((row) => row.value),
+    focus_areas: focusAreas.map((row) => row.value),
+    turnover_bases: turnoverBases,
+  });
+});
+
 app.get('/api/companies', async (request, response) => {
-  const clauses = [];
-  const values = [];
-  if (request.query.q) {
-    clauses.push('company_name LIKE ?');
-    values.push(`%${String(request.query.q).slice(0, 200)}%`);
-  }
-  if (request.query.industry) {
-    clauses.push('industry = ?');
-    values.push(String(request.query.industry).slice(0, 160));
-  }
+  const search = buildSearch(request.query);
+  const { where, params: values, page, limit, sort, direction } = search;
   if (request.query.research_status) {
     if (!researchStatuses.has(String(request.query.research_status))) {
       return response.status(400).json({ error: 'research_status is not a supported research status.' });
     }
-    clauses.push('research_status = ?');
-    values.push(String(request.query.research_status));
   }
-  const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
-  const page = Number(request.query.page || 1);
-  if (!Number.isInteger(page) || page < 1 || page > 100000) {
-    return response.status(400).json({ error: 'page must be a positive whole number.' });
-  }
-  const limit = 50;
+  const fullValues = request.query.research_status
+    ? [...values, String(request.query.research_status)]
+    : values;
+  const fullWhere = request.query.research_status
+    ? `${where ? `${where} AND` : 'WHERE'} research_status = ?` : where;
   const totalRows = await query(
-    `SELECT COUNT(*) AS total FROM companies ${where}`,
-    values,
+    `SELECT COUNT(*) AS total FROM companies c ${fullWhere}`,
+    fullValues,
   );
   const companies = await query(
-    `SELECT id, company_name, cin, industry, city, official_website, website_candidate,
-      contact_email, contact_phone, contact_name, contact_designation, priority, research_status,
-      last_researched_at, created_at, updated_at,
-      (SELECT COUNT(*) FROM documents d WHERE d.company_id = companies.id) AS document_count
-     FROM companies ${where} ORDER BY company_name LIMIT ? OFFSET ?`,
-    [...values, limit, (page - 1) * limit],
+    `SELECT c.id, c.company_name, c.cin, c.industry, c.city, c.phase, c.region, c.headquarters,
+      c.turnover_amount, c.turnover_currency, c.turnover_unit, c.turnover_original,
+      c.official_website, c.official_website_verified_at, c.website_candidate, c.notes,
+      c.contact_email, c.contact_phone, c.contact_name,
+      c.contact_designation, c.research_status, c.last_researched_at, c.created_at,
+      c.updated_at, (SELECT COUNT(*) FROM documents d WHERE d.company_id = c.id) AS document_count,
+      (SELECT GROUP_CONCAT(f.focus_area ORDER BY f.focus_area SEPARATOR ', ') FROM company_focus_areas f WHERE f.company_id = c.id) AS focus_areas
+     FROM companies c ${fullWhere} ORDER BY ${sort} ${direction}, c.id ASC LIMIT ? OFFSET ?`,
+    [...fullValues, limit, (page - 1) * limit],
   );
+  const companiesWithReadiness = companies.map((c) => {
+    const isConfirmed = Boolean(c.official_website && c.official_website_verified_at);
+    const isManualReview = !isConfirmed && Boolean(c.website_candidate || (c.notes && c.notes.includes('MANUAL_REVIEW')));
+    const websiteReadiness = isConfirmed ? 'ready_to_research' : isManualReview ? 'needs_manual_review' : 'waiting_for_website';
+    return { ...c, website_readiness: websiteReadiness };
+  });
   const industries = await query(
     'SELECT DISTINCT industry FROM companies WHERE industry IS NOT NULL AND industry <> "" ORDER BY industry',
   );
+  const locations = await query(`SELECT DISTINCT original_value AS value FROM company_source_values
+    WHERE source_column IN ('City', 'Area') AND TRIM(original_value) <> ''
+    UNION
+    SELECT DISTINCT original_value AS value FROM company_source_values
+    WHERE source_column = 'HQ' AND original_value LIKE '%India%'
+    ORDER BY value`);
   const total = Number(totalRows[0].total) || 0;
+  const focusAreas = await query('SELECT MIN(focus_area) AS focus_area FROM company_focus_areas GROUP BY normalized_focus_area ORDER BY focus_area');
   response.json({
-    companies,
+    companies: companiesWithReadiness,
     industries: industries.map((row) => row.industry),
+    locations: locations.map((row) => row.value),
+    focus_areas: focusAreas.map((row) => row.focus_area),
+    interpreted_filters: search.interpreted.filters,
     pagination: { page, limit, total, total_pages: Math.max(1, Math.ceil(total / limit)) },
   });
+});
+
+app.get('/api/companies/domain-summary', async (_request, response) => {
+  const [summary] = await query(`
+    SELECT
+      COUNT(*) AS total,
+      SUM(CASE WHEN official_website IS NOT NULL AND official_website != '' AND official_website_verified_at IS NOT NULL THEN 1 ELSE 0 END) AS ready_to_research,
+      SUM(CASE WHEN (official_website IS NULL OR official_website = '' OR official_website_verified_at IS NULL) AND (website_candidate IS NOT NULL AND website_candidate != '' OR notes LIKE '%MANUAL_REVIEW%') THEN 1 ELSE 0 END) AS needs_manual_review,
+      SUM(CASE WHEN (official_website IS NULL OR official_website = '') AND (website_candidate IS NULL OR website_candidate = '') AND (notes NOT LIKE '%MANUAL_REVIEW%' OR notes IS NULL) THEN 1 ELSE 0 END) AS waiting_for_website
+    FROM companies
+  `);
+  response.json({
+    total: Number(summary[0].total) || 0,
+    ready_to_research: Number(summary[0].ready_to_research) || 0,
+    needs_manual_review: Number(summary[0].needs_manual_review) || 0,
+    waiting_for_website: Number(summary[0].waiting_for_website) || 0,
+  });
+});
+
+app.post('/api/companies/bulk-confirm-websites', async (request, response) => {
+  let items = [];
+  if (Array.isArray(request.body?.confirmations)) {
+    items = request.body.confirmations;
+  } else if (Array.isArray(request.body?.company_ids)) {
+    items = request.body.company_ids.map((id) => ({ id }));
+  } else {
+    return response.status(400).json({ error: 'Provide company_ids array or confirmations array.' });
+  }
+  if (!items.length) {
+    return response.status(400).json({ error: 'No companies selected for confirmation.' });
+  }
+  const results = [];
+  await transaction(async (connection) => {
+    for (const item of items) {
+      const companyId = parseId(item.id || item.company_id);
+      const [existingRows] = await connection.execute(
+        'SELECT id, company_name, official_website, website_candidate, notes FROM companies WHERE id = ? FOR UPDATE',
+        [companyId],
+      );
+      if (!existingRows.length) {
+        results.push({ company_id: companyId, status: 'error', error: 'Company not found.' });
+        continue;
+      }
+      const existing = existingRows[0];
+      const candidateUrl = item.website || existing.website_candidate || existing.official_website;
+      if (!candidateUrl) {
+        results.push({ company_id: companyId, company_name: existing.company_name, status: 'error', error: 'No website URL provided or available.' });
+        continue;
+      }
+      let normalized;
+      try {
+        normalized = normalizeWebsite(candidateUrl);
+      } catch (e) {
+        results.push({ company_id: companyId, company_name: existing.company_name, status: 'error', error: e.message });
+        continue;
+      }
+      const source = item.verification_source || item.source || normalized;
+      const note = `Website verification: status=CONFIRMED; confidence=high; source=${source}; checked=${new Date().toISOString().slice(0, 10)}.`;
+      await connection.execute(
+        `UPDATE companies
+         SET official_website = ?,
+             website_candidate = NULL,
+             official_website_verified_at = NOW(),
+             notes = ?
+         WHERE id = ?`,
+        [normalized, note, companyId],
+      );
+      results.push({ company_id: companyId, company_name: existing.company_name, status: 'confirmed', official_website: normalized });
+    }
+  });
+  const confirmedCount = results.filter((r) => r.status === 'confirmed').length;
+  response.json({
+    confirmed_count: confirmedCount,
+    results,
+  });
+});
+
+app.get('/api/companies/:id/source-values', async (request, response) => {
+  const id = parseId(request.params.id);
+  const rows = await query(
+    `SELECT source_workbook, source_worksheet, source_row, source_column, original_value
+     FROM company_source_values WHERE company_id = ? ORDER BY source_workbook, source_worksheet, source_row, id`, [id],
+  );
+  response.json({ source_values: rows });
 });
 
 app.post('/api/imports/scan', express.raw({ type: 'application/octet-stream', limit: maxImportBytes }), async (request, response) => {
@@ -636,6 +766,8 @@ app.get('/api/company-domain-suggestions', async (request, response) => {
   ));
   response.json({
     suggested_website: match ? normalizeWebsite(match[1].website) : null,
+    source_url: match?.[1]?.source_url || null,
+    verification_note: match?.[1]?.verification_note || null,
     requires_confirmation: Boolean(match),
   });
 });
@@ -651,39 +783,18 @@ app.post('/api/companies', async (request, response) => {
     const result = await transaction(async (connection) => {
       const [created] = await connection.execute(
         `INSERT INTO companies
-          (company_name, normalized_name, cin, industry, city, official_website,
-           official_website_verified_at, contact_email, contact_phone, contact_name, contact_designation, priority, notes)
-         VALUES (?, ?, ?, ?, ?, ?, NOW(), ?, ?, ?, ?, ?, ?)`,
+          (company_name, normalized_name, official_website, official_website_verified_at)
+         VALUES (?, ?, ?, NOW())`,
         [
-          input.name, input.normalizedName, input.cin, input.industry, input.city,
-          input.website, input.contactEmail, input.contactPhone, input.contactName,
-          input.contactDesignation, input.priority, input.notes,
+          input.name, input.normalizedName, input.website,
         ],
       );
-      const [run] = await connection.execute(
-        `INSERT INTO research_runs (company_id, status, progress_message, confirmed_domain)
-         VALUES (?, 'queued', 'Waiting to start', ?)`,
-        [created.insertId, input.website],
-      );
-      await connection.execute(
-        'UPDATE companies SET research_status = "queued" WHERE id = ?',
-        [created.insertId],
-      );
-      return { companyId: created.insertId, runId: run.insertId };
+      return { companyId: created.insertId };
     });
+    const run = await createRun(result.companyId);
+    if (!run.existing) enqueueResearch(run);
     const company = await getCompany(result.companyId);
-    response.status(201).json({
-      company,
-      research_run: { id: result.runId, status: 'queued' },
-    });
-    void executeResearchRun({
-      id: result.runId,
-      companyId: result.companyId,
-      companyName: company.company_name,
-      website: input.website,
-    }).catch((error) => {
-      console.error(`Research run ${result.runId} failed: ${error.message}`);
-    });
+    response.status(201).json({ company, research_run: { id: run.id, status: run.status } });
   } catch (error) {
     if (error.code === 'ER_DUP_ENTRY') {
       return response.status(409).json({ error: 'A company with this name already exists.' });
@@ -720,7 +831,8 @@ app.get('/api/companies/:id', async (request, response) => {
       [id],
     ),
     query(
-      `SELECT id, research_run_id, source_url, title, file_type, document_type,
+      `SELECT id, research_run_id, source_url, source_page_url, link_text, validation_result, title, file_type, document_type,
+         (storage_name IS NOT NULL AND processing_status = 'processed') AS download_available,
          financial_year, publication_date, import_batch_row_id, processing_status,
          processing_error, downloaded_at, created_at
        FROM documents WHERE company_id = ? ORDER BY created_at DESC LIMIT 300`,
@@ -747,13 +859,13 @@ app.patch('/api/companies/:id', async (request, response) => {
     await query(
       `UPDATE companies SET company_name = ?, normalized_name = ?, industry = ?,
          cin = COALESCE(?, cin), city = ?, contact_email = ?, contact_phone = ?,
-         contact_name = ?, contact_designation = ?, priority = ?,
+         contact_name = ?, contact_designation = ?,
          official_website_verified_at = IF(official_website <=> ? AND official_website_verified_at IS NOT NULL, official_website_verified_at, NOW()),
          official_website = ?, notes = ? WHERE id = ?`,
       [
         input.name, input.normalizedName, input.industry, input.cin, input.city,
         input.contactEmail, input.contactPhone, input.contactName, input.contactDesignation,
-        input.priority, input.website, input.website,
+        input.website, input.website,
         input.notes, id,
       ],
     );
@@ -778,13 +890,57 @@ app.post('/api/companies/:id/research', async (request, response) => {
     return response.status(400).json({ error: "Confirm the company's official website before starting research." });
   }
   const companyId = parseId(request.params.id);
-  const company = await getCompany(companyId);
   const run = await createRun(companyId);
-  run.companyName = company.company_name;
-  response.status(202).json({ research_run: { id: run.id, status: 'queued' } });
-  void executeResearchRun(run).catch((error) => {
-    console.error(`Research run ${run.id} failed: ${error.message}`);
-  });
+  if (!run.existing) enqueueResearch(run);
+  response.status(run.existing ? 200 : 202).json({ research_run: { id: run.id, status: run.status, already_active: run.existing } });
+});
+
+app.post('/api/research/batch', async (request, response) => {
+  const companyIds = [...new Set((Array.isArray(request.body?.company_ids) ? request.body.company_ids : [])
+    .map((value) => Number(value)).filter((value) => Number.isSafeInteger(value) && value > 0))].slice(0, 25);
+  if (!companyIds.length) return response.status(400).json({ error: 'Select at least one company.' });
+  if (request.body?.confirm_official_websites !== true) {
+    return response.status(400).json({ error: 'Confirm that the saved domains are official before starting this batch.' });
+  }
+  const results = [];
+  for (const companyId of companyIds) {
+    try {
+      const rows = await query(
+        'SELECT id, company_name, official_website, official_website_verified_at, research_status FROM companies WHERE id = ?', [companyId],
+      );
+      if (!rows.length) { results.push({ company_id: companyId, status: 'failed', message: 'Company not found.' }); continue; }
+      if (!rows[0].official_website || !rows[0].official_website_verified_at) {
+        results.push({
+          company_id: companyId,
+          company_name: rows[0].company_name,
+          status: 'needs_domain',
+          message: 'Confirm an official website with verification source before starting research.',
+        });
+        continue;
+      }
+      const run = await createRun(companyId);
+      if (!run.existing) enqueueResearch(run);
+      results.push({ company_id: companyId, company_name: rows[0].company_name, status: run.status, run_id: run.id, already_active: run.existing });
+    } catch (error) {
+      results.push({ company_id: companyId, status: error.status === 409 ? 'already_running' : 'failed', message: error.message });
+    }
+  }
+  response.status(202).json({ results, summary: {
+    queued: results.filter((item) => item.status === 'queued' && !item.already_active).length,
+    needs_domain: results.filter((item) => item.status === 'needs_domain').length,
+    already_running: results.filter((item) => item.already_active || item.status === 'already_running').length,
+    failed: results.filter((item) => ['failed'].includes(item.status)).length,
+  } });
+});
+
+app.post('/api/companies/:id/research/retry', async (request, response) => {
+  if (request.body?.confirm_official_website !== true) {
+    return response.status(400).json({ error: "Confirm the company's official website before retrying." });
+  }
+  const companyId = parseId(request.params.id);
+  const run = await createRun(companyId);
+  if (!run.existing) enqueueResearch(run);
+  response.status(run.existing ? 200 : 202).json({ research_run: { id: run.id, status: run.status, already_active: run.existing } });
 });
 
 app.post('/api/research', async (request, response) => {
@@ -803,17 +959,14 @@ app.post('/api/research', async (request, response) => {
   const company = existing.length
     ? await findOrCreateCompany(companyName, website || existing[0].official_website)
     : await findOrCreateCompany(companyName, website);
-  if (!company.official_website) {
+  if (!company.official_website || !company.official_website_verified_at) {
     return response.status(400).json({
       error: 'A confirmed official website is required. Add it to the company profile before starting research.',
     });
   }
   const run = await createRun(company.id);
-  run.companyName = company.company_name;
-  response.status(202).json({ research_run: { id: run.id, status: 'queued' } });
-  void executeResearchRun(run).catch((error) => {
-    console.error(`Research run ${run.id} failed: ${error.message}`);
-  });
+  if (!run.existing) enqueueResearch(run);
+  response.status(run.existing ? 200 : 202).json({ research_run: { id: run.id, status: run.status, already_active: run.existing } });
 });
 
 app.get('/api/research', async (request, response) => {
@@ -864,9 +1017,10 @@ app.get('/api/research/:id', async (request, response) => {
   if (!rows.length) return response.status(404).json({ error: 'Research run not found.' });
   const [documents, findings] = await Promise.all([
     query(
-      `SELECT d.id, d.source_url, d.title, d.file_type, d.document_type, d.financial_year,
-         d.publication_date, d.import_batch_row_id, d.content_hash, d.storage_name,
-         d.processing_status, d.processing_error, d.downloaded_at, d.created_at
+      `SELECT d.id, d.source_url, d.source_page_url, d.link_text, d.validation_result, d.title, d.file_type, d.document_type, d.financial_year,
+         d.publication_date, d.import_batch_row_id, d.content_hash,
+         (d.storage_name IS NOT NULL AND d.processing_status = 'processed') AS download_available,
+         d.extracted_text, d.processing_status, d.processing_error, d.downloaded_at, d.created_at
        FROM research_run_documents rd
        JOIN documents d ON d.id = rd.document_id
        WHERE rd.research_run_id = ? ORDER BY d.title`,
@@ -886,13 +1040,17 @@ app.get('/api/research/:id', async (request, response) => {
       [id],
     ),
   ]);
+  const events = await query(
+    `SELECT id, event_type, step, message, source_url, details, created_at
+     FROM research_run_events WHERE research_run_id = ? ORDER BY created_at, id LIMIT 500`, [id],
+  );
   response.json({ research_run: rows[0], company: {
     id: rows[0].company_id,
     company_name: rows[0].company_name,
     industry: rows[0].industry,
     official_website: rows[0].official_website,
     notes: rows[0].notes,
-  }, documents, findings });
+  }, documents, findings, events });
 });
 
 app.get('/api/research/:id/documents', async (request, response) => {
@@ -900,8 +1058,10 @@ app.get('/api/research/:id/documents', async (request, response) => {
   const runs = await query('SELECT id FROM research_runs WHERE id = ?', [id]);
   if (!runs.length) return response.status(404).json({ error: 'Research run not found.' });
   const rows = await query(
-    `SELECT d.id, d.source_url, d.title, d.file_type, d.document_type, d.financial_year,
-       d.publication_date, d.import_batch_row_id, d.processing_status, d.processing_error, d.downloaded_at, d.created_at
+      `SELECT d.id, d.source_url, d.source_page_url, d.validation_result, d.title, d.file_type, d.document_type, d.financial_year,
+       d.publication_date, d.import_batch_row_id,
+       (d.storage_name IS NOT NULL AND d.processing_status = 'processed') AS download_available,
+       d.processing_status, d.processing_error, d.downloaded_at, d.created_at
      FROM research_run_documents rd
      JOIN documents d ON d.id = rd.document_id
      WHERE rd.research_run_id = ? ORDER BY d.title`,
@@ -913,7 +1073,7 @@ app.get('/api/research/:id/documents', async (request, response) => {
 app.get('/api/documents/:id', async (request, response) => {
   const id = parseId(request.params.id);
   const rows = await query(
-    `SELECT id, company_id, research_run_id, source_url, title, file_type, document_type,
+    `SELECT id, company_id, research_run_id, source_url, source_page_url, validation_result, title, file_type, document_type,
        financial_year, publication_date, import_batch_row_id, content_hash, extracted_text, processing_status,
        processing_error, downloaded_at, created_at
      FROM documents WHERE id = ?`,
@@ -921,6 +1081,32 @@ app.get('/api/documents/:id', async (request, response) => {
   );
   if (!rows.length) return response.status(404).json({ error: 'Document not found.' });
   response.json({ document: rows[0] });
+});
+
+app.get('/api/documents/:id/download', async (request, response) => {
+  const id = parseId(request.params.id);
+  const rows = await query(
+    `SELECT title, file_type, storage_name, processing_status FROM documents WHERE id = ?`, [id],
+  );
+  if (!rows.length) return response.status(404).json({ error: 'Document not found.' });
+  const { title, file_type: fileType, storage_name: storageName, processing_status: processingStatus } = rows[0];
+  if (!storageName || processingStatus !== 'processed') {
+    return response.status(404).json({ error: 'No downloaded source file is available for this document.' });
+  }
+  const storageRoot = path.resolve(process.env.DOCUMENT_STORAGE_DIR || path.join(__dirname, '..', 'research', 'documents'));
+  const filePath = path.resolve(storageRoot, storageName);
+  if (!filePath.startsWith(`${storageRoot}${path.sep}`) || !fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) {
+    return response.status(404).json({ error: 'The saved source file is no longer available.' });
+  }
+  const ext = path.extname(storageName).toLowerCase();
+  if (!['.pdf', '.html', '.txt'].includes(ext)) {
+    return response.status(404).json({ error: 'The saved file type is not available for download.' });
+  }
+  const filename = `${path.basename(String(title || 'csr-document'), path.extname(String(title || '')))
+    .replace(/[^\p{L}\p{N}._ -]/gu, '').trim().slice(0, 100) || 'csr-document'}${ext}`;
+  response.download(filePath, filename, (error) => {
+    if (error && !response.headersSent) response.status(500).json({ error: 'Could not download the saved source file.' });
+  });
 });
 
 app.get('/api/companies/:id/findings', async (request, response) => {

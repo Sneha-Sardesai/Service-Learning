@@ -78,20 +78,42 @@ test('API rejects invalid research-history pagination and review states before d
   assert.match((await badReview.json()).error, /review_status/);
 });
 
-test('API requires explicit official-domain confirmation before saving or researching', async (context) => {
+test('API validates official-website confirmation before company creation or research', async (context) => {
+  const original = {
+    host: process.env.DB_HOST,
+    name: process.env.DB_NAME,
+    user: process.env.DB_USER,
+    password: process.env.DB_PASSWORD,
+  };
   const server = app.listen(0);
-  context.after(() => closeTestServer(server));
+  context.after(async () => {
+    await closeTestServer(server);
+    for (const [key, value] of Object.entries({
+      DB_HOST: original.host,
+      DB_NAME: original.name,
+      DB_USER: original.user,
+      DB_PASSWORD: original.password,
+    })) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  });
   const base = `http://127.0.0.1:${server.address().port}`;
+  delete process.env.DB_HOST;
+  delete process.env.DB_NAME;
+  delete process.env.DB_USER;
+  delete process.env.DB_PASSWORD;
   const company = await fetch(`${base}/api/companies`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       company_name: 'Confirmation Test Company',
       official_website: 'https://company.example',
+      confirm_official_website: true,
     }),
   });
-  assert.equal(company.status, 400);
-  assert.match((await company.json()).error, /Confirm/);
+  assert.equal(company.status, 503);
+  assert.doesNotMatch((await company.json()).error, /Confirm/);
   const research = await fetch(`${base}/api/companies/1/research`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -99,6 +121,17 @@ test('API requires explicit official-domain confirmation before saving or resear
   });
   assert.equal(research.status, 400);
   assert.match((await research.json()).error, /Confirm/);
+});
+
+test('API requires official website confirmation before queueing a run', async (context) => {
+  const server = app.listen(0);
+  context.after(() => closeTestServer(server));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const response = await fetch(`${base}/api/research`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ company_name: 'Example' }),
+  });
+  assert.equal(response.status, 400);
+  assert.match((await response.json()).error, /Confirm/);
 });
 
 test('API returns an unconfirmed empty result for an unknown sample-domain match', async (context) => {
@@ -110,7 +143,24 @@ test('API returns an unconfirmed empty result for an unknown sample-domain match
   assert.equal(response.status, 200);
   assert.deepEqual(await response.json(), {
     suggested_website: null,
+    source_url: null,
+    verification_note: null,
     requires_confirmation: false,
+  });
+});
+
+test('API returns a primary-source-backed domain suggestion without confirming it', async (context) => {
+  const server = app.listen(0);
+  context.after(() => closeTestServer(server));
+  const response = await fetch(
+    `http://127.0.0.1:${server.address().port}/api/company-domain-suggestions?company_name=Dabur%20India`,
+  );
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), {
+    suggested_website: 'https://www.dabur.com/',
+    source_url: 'https://www.dabur.com/investors/financial-information/reports',
+    verification_note: 'Official Dabur reports page lists annual reports, business responsibility reports, CSR reports, and impact reports.',
+    requires_confirmation: true,
   });
 });
 
@@ -177,9 +227,30 @@ test('API normalizes newline-separated contact emails without losing source valu
   assert.equal(result.rows[0].original['CSR Email Link'], 'first@example.test\nsecond@example.test');
 });
 
-test('Node-to-Python bridge reports unknown domains without guessing', async () => {
+test('Node-to-Python bridge validates company name before starting the research engine', async () => {
   await assert.rejects(
-    runResearch('Unknown Example Company'),
-    /No confirmed official website/,
+    runResearch(''),
+    /companyName must be a non-empty string/,
   );
+});
+
+test('API validates bulk-confirm-websites payload before database access', async (context) => {
+  const server = app.listen(0);
+  context.after(() => closeTestServer(server));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const badPayload = await fetch(`${base}/api/companies/bulk-confirm-websites`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({}),
+  });
+  assert.equal(badPayload.status, 400);
+  assert.match((await badPayload.json()).error, /Provide company_ids array or confirmations array/);
+
+  const emptyList = await fetch(`${base}/api/companies/bulk-confirm-websites`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ company_ids: [] }),
+  });
+  assert.equal(emptyList.status, 400);
+  assert.match((await emptyList.json()).error, /No companies selected/);
 });

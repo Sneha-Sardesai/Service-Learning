@@ -18,8 +18,9 @@ function stderrSummary(stderr) {
 }
 
 function pythonExecutable() {
-  if (process.env.PYTHON_EXECUTABLE) return process.env.PYTHON_EXECUTABLE;
   const venvPython = path.join(projectRoot, '.venv', 'Scripts', 'python.exe');
+  const configured = String(process.env.PYTHON_EXECUTABLE || '').trim().replace(/^(['"])(.*)\1$/, '$2');
+  if (configured && fs.existsSync(configured)) return configured;
   return fs.existsSync(venvPython) ? venvPython : (process.platform === 'win32' ? 'python' : 'python3');
 }
 
@@ -30,14 +31,24 @@ function runResearch(companyName, website = '', options = {}) {
   if (typeof website !== 'string') {
     return Promise.reject(new TypeError('website must be a URL string.'));
   }
+  const configuredTimeout = Number(process.env.RESEARCH_TIMEOUT_MS || 20 * 60 * 1000);
+  const timeoutMs = Number.isFinite(configuredTimeout) && configuredTimeout >= 30_000
+    ? Math.min(configuredTimeout, 35 * 60 * 1000)
+    : 20 * 60 * 1000;
+  const configuredCrawlSeconds = Number(options.maxDurationSeconds ?? process.env.CRAWL_MAX_DURATION_SECONDS ?? 900);
+  const safeCrawlSeconds = Number.isFinite(configuredCrawlSeconds)
+    ? Math.max(10, Math.min(configuredCrawlSeconds, 1800, Math.floor((timeoutMs - 30_000) / 1000)))
+    : Math.max(10, Math.min(900, Math.floor((timeoutMs - 30_000) / 1000)));
   const args = [
     scriptPath,
     companyName.trim(),
     '--json',
     '--max-pages',
-    String(options.maxPages || process.env.MAX_CRAWL_PAGES || 40),
+    String(options.maxPages ?? process.env.MAX_CRAWL_PAGES ?? 80),
     '--max-depth',
-    String(options.maxDepth || process.env.MAX_CRAWL_DEPTH || 3),
+    String(options.maxDepth ?? process.env.MAX_CRAWL_DEPTH ?? 4),
+    '--max-duration-seconds',
+    String(safeCrawlSeconds),
   ];
   if (website.trim()) args.push('--website', website.trim());
 
@@ -52,10 +63,6 @@ function runResearch(companyName, website = '', options = {}) {
     let stdoutDiagnostics = '';
     let stderr = '';
     let outputBytes = 0;
-    const configuredTimeout = Number(process.env.RESEARCH_TIMEOUT_MS || 10 * 60 * 1000);
-    const timeoutMs = Number.isFinite(configuredTimeout) && configuredTimeout >= 1000
-      ? Math.min(configuredTimeout, 30 * 60 * 1000)
-      : 10 * 60 * 1000;
     const outputLimit = 30 * 1024 * 1024;
     let settled = false;
     const fail = (error) => {

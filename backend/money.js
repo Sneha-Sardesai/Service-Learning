@@ -2,7 +2,7 @@
 
 function parseMoney(value) {
   const text = String(value || '');
-  const match = text.match(/(?:INR|Rs\.?|₹)?\s*(\d[\d,]*(?:\.\d+)?)(?:\s*(crores?|cr|lakhs?|million|billion|mn))?/i);
+  const match = text.match(/(?:INR|Rs\.?|₹)?\s*(\d[\d,]*(?:\.\d+)?)(?:\s*\+?\s*(crores?|cr|lakhs?|million|billion|mn))?/i);
   if (!match) return { numeric: null, currency: null, unit: null };
   const numeric = match[1].replaceAll(',', '');
   if (!/^\d{1,16}(?:\.\d{1,4})?$/.test(numeric)) {

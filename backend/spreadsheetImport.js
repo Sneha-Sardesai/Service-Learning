@@ -26,6 +26,9 @@ const importFields = [
   'csr_obligation_amount',
   'csr_expenditure_amount',
   'unspent_csr_amount',
+  'turnover_amount',
+  'revenue_amount',
+  'sales_amount',
   'csr_focus_area',
   'csr_project',
   'csr_implementation_partner',
@@ -54,6 +57,9 @@ const headerAliases = {
   csr_obligation_amount: ['csr obligation', 'csr obligation amount', 'required csr spend'],
   csr_expenditure_amount: ['csr expenditure', 'csr expenditure amount', 'csr spend', 'csr spending'],
   unspent_csr_amount: ['unspent csr', 'unspent csr amount'],
+  turnover_amount: ['turnover', 'annual turnover'],
+  revenue_amount: ['revenue', 'annual revenue'],
+  sales_amount: ['sales', 'annual sales'],
   csr_focus_area: ['csr focus area', 'csr focus areas', 'focus area', 'focus areas', 'primary csr themes'],
   csr_project: ['csr project', 'csr projects', 'csr initiative', 'csr initiatives'],
   csr_implementation_partner: ['implementation partner', 'implementing partner'],
@@ -81,16 +87,60 @@ function suggestMappings(headers) {
   }));
 }
 
+function parseCsv(buffer) {
+  let text = new TextDecoder('utf-8', { fatal: false }).decode(buffer).replace(/^\uFEFF/, '');
+  if (text.includes('\uFFFD')) text = new TextDecoder('windows-1252').decode(buffer).replace(/^\uFEFF/, '');
+  const sample = text.split(/\r?\n/, 1)[0] || '';
+  const delimiter = [',', ';', '\t', '|'].map((candidate) => ({
+    candidate,
+    count: [...sample].filter((character) => character === candidate).length,
+  })).sort((a, b) => b.count - a.count)[0].candidate;
+  const matrix = [];
+  let row = [];
+  let field = '';
+  let quoted = false;
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    if (quoted) {
+      if (char === '"' && text[index + 1] === '"') { field += '"'; index += 1; }
+      else if (char === '"') quoted = false;
+      else field += char;
+    } else if (char === '"' && field === '') quoted = true;
+    else if (char === delimiter) { row.push(field); field = ''; }
+    else if (char === '\n' || char === '\r') {
+      if (char === '\r' && text[index + 1] === '\n') index += 1;
+      row.push(field); field = '';
+      if (row.some((value) => value !== '')) matrix.push(row);
+      row = [];
+    } else field += char;
+    if (row.length > 100) throw Object.assign(new Error('A worksheet may contain no more than 100 columns.'), { status: 400 });
+  }
+  if (field || row.length) { row.push(field); if (row.some((value) => value !== '')) matrix.push(row); }
+  if (matrix.length > 10001) throw Object.assign(new Error('A worksheet may contain no more than 10,000 data rows.'), { status: 400 });
+  const sourceHeaders = matrix.shift() || [];
+  const used = new Set();
+  const headers = sourceHeaders.map((value, index) => {
+    const base = String(value || '').trim() || `Column ${index + 1}`;
+    let candidate = base;
+    for (let suffix = 2; used.has(candidate); suffix += 1) candidate = `${base} (${suffix})`;
+    used.add(candidate);
+    return candidate;
+  });
+  const rows = matrix.map((values) => Object.fromEntries(headers.map((name, index) => [name, values[index] ?? ''])));
+  return [{ name: 'CSV', headers, rows }];
+}
+
 function parseSpreadsheet(buffer, filename) {
   const extension = path.extname(filename).toLowerCase();
   if (!['.csv', '.xls', '.xlsx'].includes(extension)) {
     throw Object.assign(new Error('Upload a CSV, XLS, or XLSX workbook.'), { status: 400 });
   }
-  const python = process.env.PYTHON_EXECUTABLE
-    || (() => {
-      const venvPython = path.join(projectRoot, '.venv', 'Scripts', 'python.exe');
-      return fs.existsSync(venvPython) ? venvPython : (process.platform === 'win32' ? 'python' : 'python3');
-    })();
+  if (extension === '.csv') return Promise.resolve(parseCsv(buffer));
+  const venvPython = path.join(projectRoot, '.venv', 'Scripts', 'python.exe');
+  const configuredPython = String(process.env.PYTHON_EXECUTABLE || '').trim().replace(/^(['"])(.*)\1$/, '$2');
+  const python = configuredPython && fs.existsSync(configuredPython)
+    ? configuredPython
+    : (fs.existsSync(venvPython) ? venvPython : (process.platform === 'win32' ? 'python' : 'python3'));
   return new Promise((resolve, reject) => {
     const child = spawn(python, [parserPath, extension], {
       cwd: projectRoot,

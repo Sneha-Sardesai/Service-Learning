@@ -12,7 +12,6 @@ const emptyCompany = {
   contact_phone: '',
   contact_name: '',
   contact_designation: '',
-  priority: '',
   notes: '',
 };
 const statusLabels = {
@@ -29,6 +28,16 @@ const statusLabels = {
   scanned_or_empty: 'Scanned / empty',
   encrypted: 'Encrypted',
   unsupported: 'Unsupported',
+  checking: 'Checking file',
+  discovered: 'Candidate found',
+  processing: 'Checking file',
+  processed: 'Valid report',
+  valid_pdf: 'Valid PDF',
+  skipped: 'Skipped',
+  ready_to_research: 'Ready to research',
+  needs_manual_review: 'Needs manual review',
+  waiting_for_website: 'Waiting for website',
+  needs_domain: 'Needs domain',
 };
 const unavailableFields = [
   'CSR policy',
@@ -44,6 +53,17 @@ function formatDate(value) {
   if (!value) return '—';
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? '—' : date.toLocaleDateString();
+}
+
+function formatTimestamp(value) {
+  if (!value) return '—';
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? '—' : date.toLocaleString();
+}
+
+function runNumber(value) {
+  const id = Number(value);
+  return Number.isSafeInteger(id) && id >= 0 ? id % 10 : '—';
 }
 
 function csvCell(value) {
@@ -79,41 +99,89 @@ function downloadHistoryCsv(runs) {
 function downloadRunCsv(detail) {
   const { research_run: run, company, documents = [], findings = [] } = detail;
   const rows = [
-    ['Record type', 'Run ID', 'Company', 'Official website', 'Run status', 'Started', 'Completed', 'Field / title', 'Reviewed value / source URL', 'Original extracted value', 'Financial year', 'Review status', 'Reviewer notes', 'Evidence excerpt', 'Processing status', 'Processing error'],
-    ['Run', run.id, company?.company_name, company?.official_website, run.status, run.created_at, run.completed_at, '', '', '', '', '', '', '', '', ''],
+    ['Record type', 'Run ID', 'Company', 'Official website', 'Run status', 'Started', 'Completed', 'Field / title', 'Value / source URL', 'Original extracted value', 'Financial year', 'Category', 'Numeric value', 'Currency', 'Unit', 'Provenance', 'Review status', 'Reviewer notes', 'Source evidence', 'Processing status', 'Processing error'],
+    ['Run', run.id, company?.company_name, company?.official_website, run.status, run.created_at, run.completed_at, '', '', '', '', '', '', '', '', '', '', '', '', '', ''],
     ...findings.map((finding) => [
       'Finding', run.id, company?.company_name, company?.official_website, run.status, run.created_at, run.completed_at,
       finding.field_name, finding.finding_value, finding.original_value, finding.financial_year,
-      finding.review_status, finding.reviewer_notes, finding.supporting_excerpt, '', '',
+      finding.finding_category, finding.numeric_value, finding.currency, finding.unit, finding.provenance,
+      finding.review_status, finding.reviewer_notes,
+      `${finding.supporting_excerpt}${finding.source_url ? `\n${finding.source_url}` : ''}${finding.page_number ? ` · page ${finding.page_number}` : ''}`,
+      '', '',
     ]),
     ...documents.map((item) => [
       'Document', run.id, company?.company_name, company?.official_website, run.status, run.created_at, run.completed_at,
-      item.title, item.source_url, '', '', '', '', '', item.processing_status, item.processing_error,
+      item.title, item.source_url, ...Array(10).fill(''), item.processing_status, item.processing_error,
     ]),
   ];
   downloadCsv(`research-run-${run.id}-report.csv`, rows);
 }
 
-function Status({ value }) {
-  return <span className={`status status-${value || 'not_started'}`}>{statusLabels[value] || value || 'Unknown'}</span>;
+function Status({ value, label }) {
+  return <span className={`status status-${value || 'not_started'}`}>{label || statusLabels[value] || value || 'Unknown'}</span>;
+}
+
+function deriveRunStopInfo(run) {
+  if (!run || !['failed', 'partially_completed'].includes(run.status)) return null;
+  const isPartial = run.status === 'partially_completed';
+  const err = (run.error_summary || '').toLowerCase();
+  const prog = (run.progress_message || '').toLowerCase();
+
+  let reason = run.error_summary?.split('\n')[0] || run.progress_message || (isPartial ? 'Research crawl reached limit with partial document extraction.' : 'Research run encountered an unrecoverable error.');
+  let nextStep = 'Verify the company official website and retry the research run.';
+
+  if (err.includes('data too long') || err.includes('progress_message') || prog.includes('data too long')) {
+    reason = 'The progress message exceeded the previous column length limit in the database.';
+    nextStep = 'Database migration 011 has expanded the progress message column to TEXT. You can now safely re-run research for this company.';
+  } else if (err.includes('official website') || err.includes('needs_domain') || prog.includes('needs_domain')) {
+    reason = 'No confirmed official website with verification source was recorded.';
+    nextStep = 'Edit the company profile, confirm its official corporate website URL and verification source, then retry the research run.';
+  } else if (err.includes('403') || err.includes('blocked') || err.includes('cloudflare') || err.includes('anti-bot') || prog.includes('403')) {
+    reason = 'The corporate web server rejected automated crawler requests (HTTP 403 / anti-bot challenge).';
+    nextStep = 'Manually open the corporate investor/CSR portal, download the annual CSR or BRSR report PDF, and use the spreadsheet or document import to record findings.';
+  } else if (err.includes('timeout') || err.includes('econnrefused') || err.includes('network') || err.includes('getaddrinfo') || prog.includes('timeout')) {
+    reason = 'Network connection to the corporate domain timed out or was refused.';
+    nextStep = 'Check that the official website URL is online and reachable in your browser, then retry the research run.';
+  } else if (isPartial) {
+    reason = run.summary || 'Crawl completed within page budget; some candidate reports were skipped or could not be fully parsed.';
+    nextStep = 'Review the discovered documents list below. If a desired report was skipped, check its direct URL or upload the report file directly.';
+  }
+  return { isPartial, reason, nextStep };
 }
 
 function App() {
   const [page, setPage] = useState('dashboard');
   const [dashboard, setDashboard] = useState(null);
   const [companies, setCompanies] = useState([]);
+  const [companiesLoading, setCompaniesLoading] = useState(false);
+  const [selectedCompanyIds, setSelectedCompanyIds] = useState([]);
+  const [batchResults, setBatchResults] = useState([]);
   const [industries, setIndustries] = useState([]);
+  const [locations, setLocations] = useState([]);
   const [profile, setProfile] = useState(null);
   const [selectedCompany, setSelectedCompany] = useState(null);
   const [loading, setLoading] = useState(true);
   const [databaseState, setDatabaseState] = useState('checking');
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
-  const [search, setSearch] = useState('');
-  const [industryFilter, setIndustryFilter] = useState('');
+  const [search, setSearch] = useState(() => new URLSearchParams(window.location.search).get('q') || '');
+  const [industryFilter, setIndustryFilter] = useState(() => new URLSearchParams(window.location.search).get('industry') || '');
   const [statusFilter, setStatusFilter] = useState('');
+  const [cityFilter, setCityFilter] = useState(() => new URLSearchParams(window.location.search).get('city') || '');
+  const [focusFilter, setFocusFilter] = useState(() => new URLSearchParams(window.location.search).getAll('focus'));
+  const [focusMode, setFocusMode] = useState(() => new URLSearchParams(window.location.search).get('focus_mode') || 'any');
+  const [turnoverOperator, setTurnoverOperator] = useState(() => new URLSearchParams(window.location.search).get('turnover_operator') || '');
+  const [turnoverAmount, setTurnoverAmount] = useState(() => new URLSearchParams(window.location.search).get('turnover_amount') || '');
+  const [turnoverAmountTo, setTurnoverAmountTo] = useState(() => new URLSearchParams(window.location.search).get('turnover_amount_to') || '');
+  const [contactFilter, setContactFilter] = useState(() => new URLSearchParams(window.location.search).get('contact') || '');
+  const [viewAllCompanies, setViewAllCompanies] = useState(() => new URLSearchParams(window.location.search).get('view_all') === '1');
+  const [focusAreas, setFocusAreas] = useState([]);
+  const [turnoverBases, setTurnoverBases] = useState([]);
+  const [turnoverBasis, setTurnoverBasis] = useState(() => new URLSearchParams(window.location.search).get('turnover_basis') || '');
+  const [interpretedFilters, setInterpretedFilters] = useState({});
   const [companyPage, setCompanyPage] = useState(1);
   const [companyPages, setCompanyPages] = useState(1);
+  const [companyTotal, setCompanyTotal] = useState(0);
   const [companyDialog, setCompanyDialog] = useState(null);
   const [companyForm, setCompanyForm] = useState(emptyCompany);
   const [websiteConfirmed, setWebsiteConfirmed] = useState(false);
@@ -145,7 +213,12 @@ function App() {
   const [importMappings, setImportMappings] = useState({});
   const [importPreview, setImportPreview] = useState(null);
   const [importResolutions, setImportResolutions] = useState({});
-  const [importBusy, setImportBusy] = useState(false);
+  const [websiteStatusFilter, setWebsiteStatusFilter] = useState('');
+  const [domainSummary, setDomainSummary] = useState(null);
+  const [bulkReviewOpen, setBulkReviewOpen] = useState(false);
+  const [bulkReviewItems, setBulkReviewItems] = useState([]);
+  const [bulkReviewLoading, setBulkReviewLoading] = useState(false);
+  const [bulkSubmitting, setBulkSubmitting] = useState(false);
   const submissions = useRef(new Set());
 
   async function loadDashboard() {
@@ -153,21 +226,114 @@ function App() {
     setDashboard(data);
   }
 
+  async function loadDomainSummary() {
+    try {
+      const summary = await api('/companies/domain-summary');
+      setDomainSummary(summary);
+    } catch {
+      // best-effort
+    }
+  }
+
+  async function openBulkReview() {
+    setBulkReviewLoading(true);
+    setBulkReviewOpen(true);
+    setError('');
+    try {
+      const data = await api('/companies?website_status=needs_manual_review&limit=100');
+      setBulkReviewItems((data.companies || []).map((c) => ({
+        id: c.id,
+        company_name: c.company_name,
+        industry: c.industry,
+        city: c.city,
+        candidate: c.website_candidate || '',
+        notes: c.notes || '',
+        selected: Boolean(c.website_candidate),
+      })));
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setBulkReviewLoading(false);
+    }
+  }
+
+  async function submitBulkReview() {
+    const selected = bulkReviewItems.filter((item) => item.selected && item.candidate.trim());
+    if (!selected.length) {
+      setError('Select at least one company with a valid candidate URL to confirm.');
+      return;
+    }
+    setBulkSubmitting(true);
+    setError('');
+    try {
+      const confirmations = selected.map((item) => ({
+        id: item.id,
+        website: item.candidate.trim(),
+        verification_source: item.candidate.trim(),
+      }));
+      const res = await api('/companies/bulk-confirm-websites', {
+        method: 'POST',
+        body: JSON.stringify({ confirmations }),
+      });
+      setNotice(`Successfully confirmed ${res.confirmed_count} company official website${res.confirmed_count === 1 ? '' : 's'}.`);
+      setBulkReviewOpen(false);
+      await Promise.all([loadCompanies(), loadDashboard(), loadDomainSummary()]);
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setBulkSubmitting(false);
+    }
+  }
+
   async function loadCompanies() {
+    if (!viewAllCompanies && !search.trim() && !industryFilter && !cityFilter && !focusFilter.length && !(turnoverOperator && turnoverAmount && turnoverBasis) && !contactFilter && !statusFilter && !websiteStatusFilter) {
+      setCompanies([]);
+      setCompanyPages(1);
+      setCompanyTotal(0);
+      setCompaniesLoading(false);
+      return;
+    }
     const params = new URLSearchParams();
     if (search.trim()) params.set('q', search.trim());
     if (industryFilter) params.set('industry', industryFilter);
+    if (cityFilter) params.set('city', cityFilter);
+    if (websiteStatusFilter) params.set('website_status', websiteStatusFilter);
+    for (const area of focusFilter) params.append('focus', area);
+    if (focusFilter.length) params.set('focus_mode', focusMode);
+    if (turnoverOperator && turnoverAmount && turnoverBasis && (turnoverOperator !== 'between' || turnoverAmountTo)) {
+      params.set('turnover_operator', turnoverOperator);
+      params.set('turnover_amount', turnoverAmount);
+      if (turnoverOperator === 'between') params.set('turnover_amount_to', turnoverAmountTo);
+    }
+    if (turnoverBasis) {
+      const [currency, unit] = turnoverBasis.split('|');
+      params.set('turnover_currency', currency);
+      params.set('turnover_unit', unit);
+    }
+    if (contactFilter) params.set('contact', contactFilter);
     if (statusFilter) params.set('research_status', statusFilter);
     params.set('page', String(companyPage));
-    const data = await api(`/companies${params.size ? `?${params}` : ''}`);
-    setCompanies(data.companies);
-    setIndustries(data.industries || []);
-    setCompanyPages(data.pagination?.total_pages || 1);
+    setCompaniesLoading(true);
+    try {
+      const data = await api(`/companies${params.size ? `?${params}` : ''}`);
+      setCompanies(data.companies);
+      setIndustries(data.industries || []);
+      setLocations(data.locations || []);
+      setFocusAreas(data.focus_areas || []);
+      setInterpretedFilters(data.interpreted_filters || {});
+      setCompanyPages(data.pagination?.total_pages || 1);
+      setCompanyTotal(data.pagination?.total || 0);
+    } finally {
+      setCompaniesLoading(false);
+    }
   }
 
   async function loadProfile(id) {
-    const data = await api(`/companies/${id}`);
-    setProfile(data);
+    const [data, provenance] = await Promise.all([
+      api(`/companies/${id}`),
+      api(`/companies/${id}/source-values`).catch(() => ({ source_values: [] })),
+    ]);
+    setProfile({ ...data, source_values: provenance.source_values || [] });
   }
 
   async function loadResearchHistory(nextPage = researchPage) {
@@ -235,7 +401,7 @@ function App() {
     });
     setDatabaseState(health?.database === 'available' ? 'connected' : 'unavailable');
     try {
-      await Promise.all([loadDashboard(), loadCompanies()]);
+      await Promise.all([loadDashboard(), loadCompanies(), loadDomainSummary()]);
     } catch (requestError) {
       setError(healthError || requestError.message);
     } finally {
@@ -249,7 +415,7 @@ function App() {
 
   useEffect(() => {
     const companyName = companyForm.company_name.trim();
-    if (!companyDialog || !companyName) {
+    if (!companyDialog || companyDialog.mode !== 'edit' || !companyName) {
       setDomainSuggestion(null);
       setSuggestionError('');
       setSuggestionLoading(false);
@@ -266,7 +432,7 @@ function App() {
         const data = await api(`/company-domain-suggestions?${params}`);
         if (active) {
           setDomainSuggestion(typeof data.suggested_website === 'string' && data.suggested_website.trim()
-            ? data.suggested_website
+            ? { website: data.suggested_website, source_url: data.source_url || null, verification_note: data.verification_note || null }
             : null);
         }
       } catch {
@@ -290,7 +456,31 @@ function App() {
       if (page === 'companies') loadCompanies().catch((requestError) => setError(requestError.message));
     }, 200);
     return () => clearTimeout(timer);
-  }, [search, industryFilter, statusFilter, companyPage, page]);
+  }, [search, industryFilter, statusFilter, websiteStatusFilter, cityFilter, focusFilter, focusMode, turnoverOperator, turnoverAmount, turnoverAmountTo, turnoverBasis, contactFilter, viewAllCompanies, companyPage, page]);
+
+  useEffect(() => {
+    if (page !== 'companies') return;
+    api('/companies/options').then((options) => {
+      setIndustries(options.industries || []);
+      setLocations(options.locations || []);
+      setFocusAreas(options.focus_areas || []);
+      const bases = options.turnover_bases || [];
+      setTurnoverBases(bases);
+      if (bases.length === 1) setTurnoverBasis((current) => current || `${bases[0].turnover_currency || ''}|${bases[0].turnover_unit || ''}`);
+    }).catch((requestError) => setError(requestError.message));
+  }, [page]);
+
+  useEffect(() => {
+    const params = new URLSearchParams();
+    for (const [key, value] of Object.entries({ q: search, industry: industryFilter, city: cityFilter, turnover_operator: turnoverOperator, turnover_amount: turnoverAmount, turnover_amount_to: turnoverAmountTo, turnover_basis: turnoverBasis, contact: contactFilter })) {
+      if (value) params.set(key, value);
+    }
+    for (const area of focusFilter) params.append('focus', area);
+    if (focusFilter.length && focusMode !== 'any') params.set('focus_mode', focusMode);
+    if (viewAllCompanies) params.set('view_all', '1');
+    const next = `${window.location.pathname}${params.size ? `?${params}` : ''}`;
+    window.history.replaceState({}, '', next);
+  }, [search, industryFilter, cityFilter, focusFilter, focusMode, turnoverOperator, turnoverAmount, turnoverAmountTo, turnoverBasis, contactFilter, viewAllCompanies]);
 
   useEffect(() => {
     if (page === 'research') void loadResearchHistory(researchPage);
@@ -302,6 +492,22 @@ function App() {
     const timer = window.setInterval(() => void loadResearchHistory(researchPage), 2000);
     return () => window.clearInterval(timer);
   }, [page, hasActiveHistoryRuns, researchPage]);
+
+  const activeDetailId = ['queued', 'running'].includes(runDetail?.research_run?.status)
+    ? runDetail.research_run.id : null;
+  useEffect(() => {
+    if (page !== 'researchDetail' || !activeDetailId) return undefined;
+    let alive = true;
+    const timer = window.setInterval(async () => {
+      try {
+        const data = await api(`/research/${activeDetailId}`);
+        if (alive) setRunDetail(data);
+      } catch (requestError) {
+        if (alive) setRunDetailError(requestError.message);
+      }
+    }, 1500);
+    return () => { alive = false; window.clearInterval(timer); };
+  }, [page, activeDetailId]);
 
   const profileRunState = profile?.research_runs
     ?.map((run) => `${run.id}:${run.status}`)
@@ -329,6 +535,12 @@ function App() {
     return () => window.clearInterval(timer);
   }, [hasActiveRuns]);
 
+  const batchStatusCounts = batchResults.reduce((counts, item) => {
+    const status = researchRuns.find((run) => Number(run.id) === Number(item.run_id))?.status || item.status;
+    counts[status] = (counts[status] || 0) + 1;
+    return counts;
+  }, {});
+
   function navigate(nextPage) {
     setError('');
     setNotice('');
@@ -352,7 +564,6 @@ function App() {
       contact_phone: company.contact_phone || '',
       contact_name: company.contact_name || '',
       contact_designation: company.contact_designation || '',
-      priority: company.priority || '',
       notes: company.notes || '',
     });
     setWebsiteConfirmed(false);
@@ -365,7 +576,7 @@ function App() {
     const websiteChanged = companyDialog.mode === 'create'
       ? Boolean(companyForm.official_website.trim())
       : companyForm.official_website.trim() !== (companyDialog.company.official_website || '').trim();
-    if (websiteChanged && companyForm.official_website.trim() && !websiteConfirmed) {
+    if (companyDialog.mode === 'edit' && websiteChanged && companyForm.official_website.trim() && !websiteConfirmed) {
       setError('Confirm that this is the company’s official website before saving it.');
       return;
     }
@@ -375,10 +586,7 @@ function App() {
     try {
       const isEdit = companyDialog.mode === 'edit';
       if (!isEdit) {
-        const params = new URLSearchParams({
-          name: companyForm.company_name.trim(),
-          ...(companyForm.cin.trim() ? { cin: companyForm.cin.trim() } : {}),
-        });
+        const params = new URLSearchParams({ name: companyForm.company_name.trim() });
         const { matches = [] } = await api(`/companies/matches?${params}`);
         if (matches.length) {
           if (window.confirm(`${matches[0].company_name} is already in the registry. Open that existing company instead?`)) {
@@ -389,22 +597,27 @@ function App() {
           throw new Error('A matching company already exists. Select the existing registry record to continue.');
         }
       }
-      const result = await api(isEdit ? `/companies/${companyDialog.company.id}` : '/companies', {
+      const saved = await api(isEdit ? `/companies/${companyDialog.company.id}` : '/companies', {
         method: isEdit ? 'PATCH' : 'POST',
-        body: JSON.stringify({
+        body: JSON.stringify(isEdit ? {
           ...companyForm,
           confirm_official_website: websiteConfirmed,
+        } : {
+          company_name: companyForm.company_name.trim(),
+          official_website: companyForm.official_website.trim(),
+          confirm_official_website: true,
         }),
       });
       setCompanyDialog(null);
       setNotice(isEdit
         ? 'Company details updated.'
-        : `Company added and research run ${result.research_run.id} queued.`);
-      if (!isEdit && result.research_run) {
-        setPage('research');
-        setResearchPage(1);
+        : `Company added; research run ${runNumber(saved.research_run.id)} is queued using its confirmed official website.`);
+      if (!isEdit) {
+        setViewAllCompanies(true);
+        setCompanyPage(1);
+        setPage('companies');
       }
-      await Promise.all([loadCompanies(), loadDashboard()]);
+      await Promise.all([isEdit ? loadCompanies() : Promise.resolve(), loadDashboard()]);
       if (selectedCompany && isEdit) await loadProfile(selectedCompany.id);
     } catch (requestError) {
       setError(requestError.message);
@@ -531,7 +744,9 @@ function App() {
         method: 'POST',
         body: JSON.stringify({ confirm_official_website: true }),
       });
-      setNotice(`Research run ${response.research_run.id} was queued.`);
+      setNotice(response.research_run.already_active
+        ? `Research run ${runNumber(response.research_run.id)} is already ${response.research_run.status}.`
+        : `Research run ${runNumber(response.research_run.id)} was queued.`);
       setPage('research');
       setResearchPage(1);
       setSelectedCompany(company);
@@ -543,6 +758,36 @@ function App() {
       setResearching(false);
       submissions.current.delete(`research-${company.id}`);
       setResearchDialog(null);
+    }
+  }
+
+  async function startBatchResearch() {
+    if (!selectedCompanyIds.length) return;
+    if (selectedCompanyIds.length > 25) {
+      setError('A batch can include up to 25 companies. Reduce your selection and start another batch.');
+      return;
+    }
+    const confirmed = window.confirm(`Queue research for ${selectedCompanyIds.length} selected companies that have saved official domains? Companies without confirmed domains will be listed and skipped.`);
+    if (!confirmed) return;
+    setResearching(true);
+    try {
+      const result = await api('/research/batch', {
+        method: 'POST',
+        body: JSON.stringify({ company_ids: selectedCompanyIds, confirm_official_websites: true }),
+      });
+      const queued = result.summary?.queued || 0;
+      const skipped = (result.summary?.needs_domain || 0) + (result.summary?.already_running || 0) + (result.summary?.failed || 0);
+      const details = (result.results || []).filter((item) => item.status !== 'queued').map((item) => `${item.company_name || `Company ${item.company_id}`}: ${item.message || item.status}`).join(' · ');
+      setBatchResults(result.results || []);
+      setNotice(`Batch queued ${queued} run${queued === 1 ? '' : 's'}; ${skipped} skipped or failed.${details ? ` ${details}` : ''}`);
+      setSelectedCompanyIds([]);
+      setPage('research');
+      setResearchPage(1);
+      await Promise.all([loadDashboard(), loadCompanies()]);
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setResearching(false);
     }
   }
 
@@ -674,8 +919,44 @@ function App() {
           {dashboard && page === 'companies' && (
             <section>
               <div className="page-heading">
-                <div><p className="eyebrow">RESEARCH DIRECTORY</p><h1>Companies</h1><p className="muted">Manage official sources and review company research history.</p></div>
-                <div className="page-actions"><button className="button button-outline" onClick={() => { setImportOpen(true); setImportFile(null); setImportScan(null); setImportPreview(null); }}>Import spreadsheet</button><button className="button button-primary" onClick={openNewCompany}>＋ Add company</button></div>
+                <div><p className="eyebrow">COMPANY DIRECTORY</p><h1>Find companies</h1><p className="muted">Search companies, review their official sources, and track report discovery.</p></div>
+                <div className="page-actions">
+                  <button className="button button-outline" onClick={() => void openBulkReview()}>
+                    Bulk review candidates ({domainSummary?.needs_manual_review ?? '—'})
+                  </button>
+                  <button className="button button-outline" onClick={() => { setImportOpen(true); setImportFile(null); setImportScan(null); setImportPreview(null); }}>Import spreadsheet</button>
+                  <button className="button button-primary" onClick={openNewCompany}>＋ Add company</button>
+                </div>
+              </div>
+              <div className="readiness-filter-chips">
+                <button
+                  type="button"
+                  className={`readiness-chip ${websiteStatusFilter === '' ? 'active' : ''}`}
+                  onClick={() => { setCompanyPage(1); setWebsiteStatusFilter(''); }}
+                >
+                  All companies <span className="chip-count">{domainSummary?.total ?? companyTotal}</span>
+                </button>
+                <button
+                  type="button"
+                  className={`readiness-chip ${websiteStatusFilter === 'ready_to_research' ? 'active' : ''}`}
+                  onClick={() => { setCompanyPage(1); setWebsiteStatusFilter('ready_to_research'); }}
+                >
+                  Ready to research <span className="chip-count">{domainSummary?.ready_to_research ?? '—'}</span>
+                </button>
+                <button
+                  type="button"
+                  className={`readiness-chip ${websiteStatusFilter === 'needs_manual_review' ? 'active' : ''}`}
+                  onClick={() => { setCompanyPage(1); setWebsiteStatusFilter('needs_manual_review'); }}
+                >
+                  Needs manual review <span className="chip-count">{domainSummary?.needs_manual_review ?? '—'}</span>
+                </button>
+                <button
+                  type="button"
+                  className={`readiness-chip ${websiteStatusFilter === 'waiting_for_website' ? 'active' : ''}`}
+                  onClick={() => { setCompanyPage(1); setWebsiteStatusFilter('waiting_for_website'); }}
+                >
+                  Waiting for website <span className="chip-count">{domainSummary?.waiting_for_website ?? '—'}</span>
+                </button>
               </div>
               <div className="filter-bar">
                 <label className="search-box"><span>⌕</span><input value={search} onChange={(event) => { setCompanyPage(1); setSearch(event.target.value); }} placeholder="Search company name…" /></label>
@@ -683,12 +964,25 @@ function App() {
                   <option value="">All industries</option>
                   {industries.map((industry) => <option key={industry}>{industry}</option>)}
                 </select>
-                <select value={statusFilter} onChange={(event) => { setCompanyPage(1); setStatusFilter(event.target.value); }} aria-label="Filter by research status">
-                  <option value="">All research statuses</option>
-                  {['not_started', 'queued', 'running', 'completed', 'partially_completed', 'failed'].map((status) => <option key={status} value={status}>{statusLabels[status]}</option>)}
+                <select value={cityFilter} onChange={(event) => { setCompanyPage(1); setCityFilter(event.target.value); }} aria-label="Filter by location">
+                  <option value="">All locations</option>{locations.map((city) => <option key={city}>{city}</option>)}
                 </select>
               </div>
-              <CompanyTable companies={companies} onOpen={openProfile} onEdit={openEditCompany} onDelete={deleteCompany} onResearch={startResearch} />
+              {Object.keys(interpretedFilters).length > 0 && <div className="interpreted-filters"><strong>Interpreted from your query</strong>{Object.entries(interpretedFilters).map(([key, value]) => <span className="filter-chip" key={key}>{key.replaceAll('_', ' ')}: {value}</span>)}<small>Edit available fields in Advanced filters.</small></div>}
+              <div className="page-actions"><span className="muted">Starting a run uses each selected company’s confirmed official website.</span><button className="button button-outline" disabled={!selectedCompanyIds.length || researching} onClick={() => void startBatchResearch()}>{researching ? 'Queueing…' : 'Start research for selection'}</button></div>
+              <details className="advanced-filters"><summary>Advanced filters</summary><div className="advanced-filter-grid">
+                <div className="focus-area-filter">
+                  <strong>CSR focus areas</strong>
+                  <div className="focus-area-toolbar"><label>Match<select value={focusMode} onChange={(event) => { setCompanyPage(1); setFocusMode(event.target.value); }}><option value="any">any selected area</option><option value="all">all selected areas</option></select></label><button className="text-button" type="button" disabled={!focusFilter.length} onClick={() => { setCompanyPage(1); setFocusFilter([]); }}>Clear selected</button></div>
+                  {focusFilter.length > 0 && <div className="focus-selected-values">{focusFilter.map((area) => <button type="button" className="focus-selected-chip" key={area} onClick={() => { setCompanyPage(1); setFocusFilter((current) => current.filter((item) => item !== area)); }}>{area}<span aria-hidden="true"> ×</span><span className="sr-only">Remove {area}</span></button>)}</div>}
+                  <div className="focus-area-options" aria-label="Select CSR focus areas">{focusAreas.map((area) => <label key={area}><input type="checkbox" checked={focusFilter.includes(area)} onChange={() => { setCompanyPage(1); setFocusFilter((current) => current.includes(area) ? current.filter((item) => item !== area) : [...current, area]); }} />{area}</label>)}</div>
+                </div>
+                <label>Annual turnover comparison<select value={turnoverOperator} onChange={(event) => { setCompanyPage(1); setTurnoverOperator(event.target.value); }}><option value="">No turnover condition</option><option value="gt">Greater than</option><option value="gte">Greater than or equal to</option><option value="lt">Less than</option><option value="lte">Less than or equal to</option><option value="between">Between</option></select></label>
+                {turnoverOperator && <><label>{turnoverOperator === 'between' ? `From amount${turnoverBasis ? ` (${turnoverBasis.replace('|', ' · ')})` : ''}` : `Amount${turnoverBasis ? ` (${turnoverBasis.replace('|', ' · ')})` : ''}`}<input type="number" min="0" step="any" value={turnoverAmount} onChange={(event) => { setCompanyPage(1); setTurnoverAmount(event.target.value); }} placeholder="Enter amount" /></label>{turnoverOperator === 'between' && <label>{`To amount${turnoverBasis ? ` (${turnoverBasis.replace('|', ' · ')})` : ''}`}<input type="number" min="0" step="any" value={turnoverAmountTo} onChange={(event) => { setCompanyPage(1); setTurnoverAmountTo(event.target.value); }} placeholder="Enter upper amount" /></label>}<label>Currency and unit<select value={turnoverBasis} onChange={(event) => setTurnoverBasis(event.target.value)}><option value="">Select currency / unit</option>{turnoverBases.map((basis, index) => <option key={`${basis.turnover_currency}-${basis.turnover_unit}-${index}`} value={`${basis.turnover_currency || ''}|${basis.turnover_unit || ''}`}>{[basis.turnover_currency, basis.turnover_unit].filter(Boolean).join(' · ') || 'Unspecified currency / unit'}</option>)}</select></label></>}
+                <label>CSR contact<select value={contactFilter} onChange={(event) => setContactFilter(event.target.value)}><option value="">Any contact status</option><option value="present">Has CSR contact</option><option value="missing_email">Missing CSR email</option></select></label>
+              </div><small>Filters combine with AND. Turnover uses the selected source currency and unit without conversion. Companies with missing turnover remain available unless a turnover comparison is active.</small></details>
+              <div className="page-actions discovery-actions"><span className="muted">{viewAllCompanies || companies.length ? `${companyTotal} matching companies` : 'Search to begin, or choose View all companies.'}</span><div><button className="button button-outline button-small" onClick={() => { setSearch(''); setIndustryFilter(''); setStatusFilter(''); setCityFilter(''); setFocusFilter([]); setFocusMode('any'); setTurnoverOperator(''); setTurnoverAmount(''); setTurnoverAmountTo(''); setTurnoverBasis(''); setContactFilter(''); setCompanyPage(1); setViewAllCompanies(false); }}>Clear filters</button><button className="button button-primary button-small" onClick={() => { setViewAllCompanies(true); setCompanyPage(1); }}>View all companies</button></div></div>
+              {companiesLoading ? <div className="loading-card">Searching the company database…</div> : !viewAllCompanies && !search && !industryFilter && !cityFilter && !focusFilter.length && !(turnoverOperator && turnoverAmount && turnoverBasis) && !contactFilter ? <div className="empty-state"><h2>Search the company data</h2><p>Try “IT companies in Pune”, “education”, or a company name. Use View all companies when you need the full directory.</p></div> : <CompanyTable companies={companies} selectedIds={selectedCompanyIds} onToggle={(id) => setSelectedCompanyIds((ids) => ids.includes(id) ? ids.filter((value) => value !== id) : [...ids, id])} onOpen={openProfile} onEdit={openEditCompany} onDelete={deleteCompany} onResearch={startResearch} />}
               {companyPages > 1 && <div className="pagination"><span>Page {companyPage} of {companyPages}</span><div><button className="button button-outline button-small" disabled={companyPage <= 1} onClick={() => setCompanyPage((current) => current - 1)}>Previous</button><button className="button button-outline button-small" disabled={companyPage >= companyPages} onClick={() => setCompanyPage((current) => current + 1)}>Next</button></div></div>}
             </section>
           )}
@@ -696,14 +990,14 @@ function App() {
           {page === 'research' && (
             <section>
               <div className="page-heading"><div><p className="eyebrow">ACTIVITY</p><h1>Research runs</h1><p className="muted">Persisted run history and current document-processing status.</p></div><div className="page-actions"><button className="button button-outline" onClick={() => void exportAllResearchHistory()} disabled={exportingHistory}>{exportingHistory ? 'Preparing CSV…' : 'Export all CSV'}</button><button className="button button-outline" onClick={() => void loadResearchHistory(researchPage)} disabled={researchLoading}>{researchLoading ? 'Refreshing…' : 'Refresh history'}</button></div></div>
+              {batchResults.length > 0 && <><div className="section-heading"><div><p className="eyebrow">LATEST BATCH</p><h2>{batchStatusCounts.completed || 0} completed · {batchStatusCounts.partially_completed || 0} partial · {batchStatusCounts.failed || 0} failed · {batchStatusCounts.queued || 0} queued · {batchStatusCounts.running || 0} running · {batchStatusCounts.needs_domain || 0} need a domain · {batchStatusCounts.already_running || 0} already running</h2></div></div><div className="table-wrap"><table><thead><tr><th>Company</th><th>Run ID</th><th>Status</th><th>Details</th></tr></thead><tbody>{batchResults.map((item) => { const savedRun = researchRuns.find((run) => Number(run.id) === Number(item.run_id)); return <tr key={item.company_id}><td>{item.company_name || `Company ${item.company_id}`}</td><td>{item.run_id ? runNumber(item.run_id) : '—'}</td><td><Status value={savedRun?.status || item.status} /></td><td>{item.message || savedRun?.error_summary || savedRun?.progress_message || 'Queued for research'}</td></tr>; })}</tbody></table></div></>}
               {researchError && <div className="alert alert-error" role="alert">{researchError}<button onClick={() => setResearchError('')} aria-label="Dismiss history error">×</button></div>}
               {researchLoading && researchRuns.length === 0 ? <div className="loading-card">Loading saved research runs…</div> : null}
-              {!researchLoading && !researchError && researchRuns.length === 0 ? <div className="empty-state"><h2>No saved research runs</h2><p>Start a run from a company profile after confirming its official website.</p><button className="button button-outline" onClick={() => navigate('companies')}>Browse companies</button></div> : null}
+              {!researchLoading && !researchError && researchRuns.length === 0 ? <div className="empty-state"><h2>No saved research runs</h2><p>Add a company with its confirmed official website to queue report discovery.</p><button className="button button-outline" onClick={() => navigate('companies')}>Browse companies</button></div> : null}
               {researchRuns.length > 0 && <ResearchRuns runs={researchRuns} onDetails={(run) => void openRunDetail(run.id)} onCompany={(run) => {
                 void openProfileById(run.company_id);
               }} />}
               {researchRuns.length > 0 && <div className="pagination"><span>Page {researchPagination.page || researchPage} of {researchPagination.total_pages || 1}{researchPagination.total != null ? ` · ${researchPagination.total} runs` : ''}</span><div><button className="button button-outline button-small" disabled={researchLoading || researchPage <= 1} onClick={() => void loadResearchHistory(researchPage - 1)}>Previous</button><button className="button button-outline button-small" disabled={researchLoading || researchPage >= (researchPagination.total_pages || 1)} onClick={() => void loadResearchHistory(researchPage + 1)}>Next</button></div></div>}
-              <div className="callout"><strong>How this works</strong><p>The researcher stays on the confirmed company website, follows crawl limits, respects robots.txt, and records errors instead of guessing when a source cannot be reached.</p></div>
             </section>
           )}
 
@@ -746,22 +1040,21 @@ function App() {
           <form className="modal-card" onSubmit={saveCompany}>
             <div className="modal-heading"><div><p className="eyebrow">{companyDialog.mode === 'edit' ? 'COMPANY DETAILS' : 'NEW RECORD'}</p><h2>{companyDialog.mode === 'edit' ? 'Edit company' : 'Add company'}</h2></div><button type="button" className="icon-button" disabled={saving} onClick={() => setCompanyDialog(null)} aria-label="Close">×</button></div>
             <label>Company name <span className="required">*</span><input autoFocus required maxLength="200" value={companyForm.company_name} onChange={(event) => { setCompanyForm({ ...companyForm, company_name: event.target.value }); setWebsiteConfirmed(false); setDomainSuggestion(null); }} /></label>
-            <label>CIN<input maxLength="21" value={companyForm.cin} onChange={(event) => setCompanyForm({ ...companyForm, cin: event.target.value })} /></label>
-            <label>Industry<input maxLength="160" value={companyForm.industry} onChange={(event) => setCompanyForm({ ...companyForm, industry: event.target.value })} placeholder="e.g. Automotive" /></label>
-            <label>Headquarters / city<input maxLength="160" value={companyForm.city} onChange={(event) => setCompanyForm({ ...companyForm, city: event.target.value })} /></label>
-            <label>Confirmed official website {companyDialog.mode === 'create' && <span className="required">*</span>}<input type="text" inputMode="url" required={companyDialog.mode === 'create'} value={companyForm.official_website} onChange={(event) => { setCompanyForm({ ...companyForm, official_website: event.target.value }); setWebsiteConfirmed(false); }} placeholder="https://www.company.com" /><small>Enter a researcher-confirmed domain; the crawler will not guess one.</small></label>
-            {suggestionLoading && <p className="suggestion-note" role="status">Checking for a domain suggestion…</p>}
-            {!suggestionLoading && domainSuggestion && <div className="domain-suggestion"><div><strong>Registry suggestion</strong><span>{domainSuggestion}</span><small>Suggestion only. Verify the domain before saving or researching.</small></div><button type="button" className="button button-outline button-small" onClick={() => { setCompanyForm((current) => ({ ...current, official_website: domainSuggestion })); setWebsiteConfirmed(false); }}>Use suggestion</button></div>}
-            {!suggestionLoading && suggestionError && <p className="suggestion-note" role="status">{suggestionError}</p>}
-            {!suggestionLoading && !suggestionError && !domainSuggestion && companyDialog && companyForm.company_name.trim() && <p className="suggestion-note">No domain suggestion was returned for this name.</p>}
-            {companyForm.official_website.trim() && (companyDialog.mode === 'create' || companyForm.official_website.trim() !== (companyDialog.company.official_website || '').trim() || !companyDialog.company.official_website_verified_at) && <label className="checkbox-label"><input type="checkbox" checked={websiteConfirmed} onChange={(event) => setWebsiteConfirmed(event.target.checked)} />I confirm this is the company’s official website and is suitable as a research starting point.</label>}
-            <label>Contact email<input type="email" maxLength="254" value={companyForm.contact_email} onChange={(event) => setCompanyForm({ ...companyForm, contact_email: event.target.value })} /></label>
-            <label>Contact phone<input maxLength="40" value={companyForm.contact_phone} onChange={(event) => setCompanyForm({ ...companyForm, contact_phone: event.target.value })} /></label>
-            <label>CSR contact name<input maxLength="200" value={companyForm.contact_name} onChange={(event) => setCompanyForm({ ...companyForm, contact_name: event.target.value })} /></label>
-            <label>Contact designation<input maxLength="160" value={companyForm.contact_designation} onChange={(event) => setCompanyForm({ ...companyForm, contact_designation: event.target.value })} /></label>
-            <label>Research priority<input maxLength="80" value={companyForm.priority} onChange={(event) => setCompanyForm({ ...companyForm, priority: event.target.value })} /></label>
-            <label>Research notes<textarea rows="3" maxLength="10000" value={companyForm.notes} onChange={(event) => setCompanyForm({ ...companyForm, notes: event.target.value })} /></label>
-            <div className="modal-actions"><button type="button" className="button button-outline" disabled={saving} onClick={() => setCompanyDialog(null)}>Cancel</button><button className="button button-primary" disabled={saving || (companyDialog.mode === 'create' && !companyForm.official_website.trim()) || (Boolean(companyForm.official_website.trim()) && (companyDialog.mode === 'create' || companyForm.official_website.trim() !== (companyDialog.company.official_website || '').trim() || !companyDialog.company.official_website_verified_at) && !websiteConfirmed)}>{saving ? 'Saving…' : companyDialog.mode === 'create' ? 'Add and start research' : 'Save company'}</button></div>
+            {companyDialog.mode === 'create' ? <label>Official website <span className="required">*</span><input type="text" inputMode="url" required value={companyForm.official_website} onChange={(event) => setCompanyForm({ ...companyForm, official_website: event.target.value })} placeholder="https://www.company.com" /></label> : <div className="company-edit-fields">
+              <label>Industry<input maxLength="160" value={companyForm.industry} onChange={(event) => setCompanyForm({ ...companyForm, industry: event.target.value })} placeholder="e.g. Automotive" /></label>
+              <label>Headquarters / city<input maxLength="160" value={companyForm.city} onChange={(event) => setCompanyForm({ ...companyForm, city: event.target.value })} /></label>
+              <label>Confirmed official website<input type="text" inputMode="url" value={companyForm.official_website} onChange={(event) => { setCompanyForm({ ...companyForm, official_website: event.target.value }); setWebsiteConfirmed(false); }} placeholder="https://www.company.com" /></label>
+              {suggestionLoading && <p className="suggestion-note" role="status">Checking for a domain suggestion…</p>}
+              {!suggestionLoading && domainSuggestion && <div className="domain-suggestion"><strong>Official source suggestion: {domainSuggestion.website}</strong><button type="button" className="button button-outline button-small" onClick={() => setCompanyForm((current) => ({ ...current, official_website: domainSuggestion.website }))}>Use suggestion</button></div>}
+              {!suggestionLoading && suggestionError && <p className="suggestion-note" role="status">{suggestionError}</p>}
+              {companyForm.official_website.trim() && (companyForm.official_website.trim() !== (companyDialog.company.official_website || '').trim() || !companyDialog.company.official_website_verified_at) && <label className="checkbox-label"><input type="checkbox" checked={websiteConfirmed} onChange={(event) => setWebsiteConfirmed(event.target.checked)} />I confirm this is the company’s official website and is suitable as a research starting point.</label>}
+              <label>Contact email<input type="email" maxLength="254" value={companyForm.contact_email} onChange={(event) => setCompanyForm({ ...companyForm, contact_email: event.target.value })} /></label>
+              <label>Contact phone<input maxLength="40" value={companyForm.contact_phone} onChange={(event) => setCompanyForm({ ...companyForm, contact_phone: event.target.value })} /></label>
+              <label>CSR contact name<input maxLength="200" value={companyForm.contact_name} onChange={(event) => setCompanyForm({ ...companyForm, contact_name: event.target.value })} /></label>
+              <label>Contact designation<input maxLength="160" value={companyForm.contact_designation} onChange={(event) => setCompanyForm({ ...companyForm, contact_designation: event.target.value })} /></label>
+              <label>Research notes<textarea rows="3" maxLength="10000" value={companyForm.notes} onChange={(event) => setCompanyForm({ ...companyForm, notes: event.target.value })} /></label>
+            </div>}
+            <div className="modal-actions"><button type="button" className="button button-outline" disabled={saving} onClick={() => setCompanyDialog(null)}>Cancel</button><button className="button button-primary" disabled={saving || (companyDialog.mode === 'create' && (!companyForm.company_name.trim() || !companyForm.official_website.trim())) || (companyDialog.mode === 'edit' && Boolean(companyForm.official_website.trim()) && (companyForm.official_website.trim() !== (companyDialog.company.official_website || '').trim() || !companyDialog.company.official_website_verified_at) && !websiteConfirmed)}>{saving ? 'Saving…' : companyDialog.mode === 'create' ? 'Add company' : 'Save company'}</button></div>
           </form>
         </div>
       )}
@@ -805,6 +1098,98 @@ function App() {
         </div>
       )}
 
+      {bulkReviewOpen && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !bulkSubmitting) setBulkReviewOpen(false); }}>
+          <div className="modal-card bulk-modal-card">
+            <div className="modal-heading">
+              <div>
+                <p className="eyebrow">BULK WEBSITE REVIEW</p>
+                <h2>Review candidate websites ({bulkReviewItems.length} companies)</h2>
+              </div>
+              <button type="button" className="icon-button" disabled={bulkSubmitting} onClick={() => setBulkReviewOpen(false)} aria-label="Close">×</button>
+            </div>
+            <p className="muted">Review candidate websites identified from authoritative sources. Uncheck any companies that require further investigation, edit candidate URLs if necessary, and confirm verified websites in bulk.</p>
+            {bulkReviewLoading ? (
+              <div className="loading-card">Loading companies needing manual review…</div>
+            ) : !bulkReviewItems.length ? (
+              <div className="empty-state"><p>No companies currently need manual review. All companies are either confirmed or waiting for candidate URLs.</p></div>
+            ) : (
+              <>
+                <div className="page-actions" style={{ justifyContent: 'space-between', margin: '10px 0' }}>
+                  <div>
+                    <button type="button" className="button button-outline button-small" onClick={() => setBulkReviewItems((items) => items.map((item) => ({ ...item, selected: true })))}>Select all</button>
+                    <button type="button" className="button button-outline button-small" style={{ marginLeft: 6 }} onClick={() => setBulkReviewItems((items) => items.map((item) => ({ ...item, selected: false })))}>Deselect all</button>
+                  </div>
+                  <span className="muted">{bulkReviewItems.filter((i) => i.selected).length} selected for confirmation</span>
+                </div>
+                <div className="bulk-table-wrap">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th style={{ width: 40 }}>Select</th>
+                        <th style={{ width: 180 }}>Company</th>
+                        <th style={{ width: 140 }}>Location / Industry</th>
+                        <th>Candidate website</th>
+                        <th style={{ width: 180 }}>Review notes / source</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {bulkReviewItems.map((item, index) => (
+                        <tr key={item.id}>
+                          <td>
+                            <input
+                              type="checkbox"
+                              checked={item.selected}
+                              onChange={(e) => {
+                                const checked = e.target.checked;
+                                setBulkReviewItems((items) => items.map((it, idx) => idx === index ? { ...it, selected: checked } : it));
+                              }}
+                            />
+                          </td>
+                          <td>
+                            <strong>{item.company_name}</strong>
+                          </td>
+                          <td>{[item.industry, item.city].filter(Boolean).join(' · ') || '—'}</td>
+                          <td>
+                            <input
+                              type="url"
+                              className="bulk-candidate-input"
+                              value={item.candidate}
+                              placeholder="https://www.example.com/"
+                              onChange={(e) => {
+                                const val = e.target.value;
+                                setBulkReviewItems((items) => items.map((it, idx) => idx === index ? { ...it, candidate: val } : it));
+                              }}
+                            />
+                            {item.candidate && (
+                              <a href={item.candidate} target="_blank" rel="noreferrer" className="source-link" style={{ display: 'inline-block', marginTop: 2 }}>
+                                Test link ↗
+                              </a>
+                            )}
+                          </td>
+                          <td><small className="muted">{item.notes ? item.notes.replace(/^Website verification:\s*/, '') : 'Manual review'}</small></td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                <div className="modal-actions">
+                  <button type="button" className="button button-outline" disabled={bulkSubmitting} onClick={() => setBulkReviewOpen(false)}>Cancel</button>
+                  <button
+                    type="button"
+                    className="button button-primary"
+                    disabled={bulkSubmitting || !bulkReviewItems.some((i) => i.selected && i.candidate.trim())}
+                    onClick={() => void submitBulkReview()}
+                  >
+                    {bulkSubmitting ? 'Confirming…' : `Confirm ${bulkReviewItems.filter((i) => i.selected && i.candidate.trim()).length} selected websites`}
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
       {document && (
         <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setDocument(null); }}>
           <div className="modal-card document-modal">
@@ -843,22 +1228,53 @@ function Dashboard({ dashboard, onPage, onCompany, onDetails }) {
   );
 }
 
-function CompanyTable({ companies, onOpen, onEdit, onDelete, onResearch }) {
-  if (!companies.length) return <div className="empty-state"><h2>No companies yet</h2><p>Add a company and its confirmed official website to begin.</p></div>;
+function CompanyTable({ companies, selectedIds = [], onToggle = () => {}, onOpen, onEdit, onDelete, onResearch }) {
+  if (!companies.length) return <div className="empty-state"><h2>No companies match</h2><p>Adjust the search or clear a filter to broaden the results.</p></div>;
   return (
     <div className="table-wrap">
       <table>
-        <thead><tr><th>Company</th><th>Industry</th><th>Research status</th><th>Documents</th><th>Last researched</th><th><span className="sr-only">Actions</span></th></tr></thead>
-        <tbody>{companies.map((company) => (
-          <tr key={company.id}>
-            <td><button className="company-link" onClick={() => onOpen(company)}>{company.company_name}</button><small className="table-subtitle">{company.official_website || (company.website_candidate ? `Unverified: ${company.website_candidate}` : 'Official website not set')}</small></td>
-            <td>{[company.industry, company.city].filter(Boolean).join(' · ') || '—'}</td>
-            <td><Status value={company.research_status} /></td>
-            <td>{company.document_count ?? 0}</td>
-            <td>{formatDate(company.last_researched_at)}</td>
-            <td><div className="row-actions"><button title="Start research" disabled={!company.official_website} onClick={() => onResearch(company)}>Research</button><button title="Edit company" onClick={() => onEdit(company)}>Edit</button><button title="Delete company" className="danger-text" onClick={() => onDelete(company)}>Delete</button></div></td>
-          </tr>
-        ))}</tbody>
+        <thead><tr><th>Select</th><th>Company</th><th>Website status</th><th>Industry / location</th><th>Turnover</th><th>CSR focus areas</th><th>CSR contact</th><th><span className="sr-only">Actions</span></th></tr></thead>
+        <tbody>{companies.map((company) => {
+          const isReady = company.website_readiness === 'ready_to_research' || (Boolean(company.official_website) && Boolean(company.official_website_verified_at));
+          const isReview = company.website_readiness === 'needs_manual_review' || (!isReady && Boolean(company.website_candidate || (company.notes && company.notes.includes('MANUAL_REVIEW'))));
+          return (
+            <tr key={company.id}>
+              <td><input type="checkbox" aria-label={`Select ${company.company_name}`} checked={selectedIds.includes(company.id)} onChange={() => onToggle(company.id)} /></td>
+              <td>
+                <button className="company-link" onClick={() => onOpen(company)}>{company.company_name}</button>
+                <small className="table-subtitle">
+                  {company.official_website ? company.official_website : (company.website_candidate ? <span className="candidate-tag">Candidate: {company.website_candidate}</span> : 'Official website not set')}
+                </small>
+              </td>
+              <td>
+                {isReady && <span className="readiness-badge readiness-ready">Ready to research</span>}
+                {isReview && <span className="readiness-badge readiness-review">Needs manual review</span>}
+                {!isReady && !isReview && <span className="readiness-badge readiness-waiting">Waiting for website</span>}
+              </td>
+              <td>{[company.industry, company.city].filter(Boolean).join(' · ') || '—'}</td>
+              <td>{company.turnover_original || (company.turnover_amount == null ? '—' : `${company.turnover_amount} ${company.turnover_unit || ''} ${company.turnover_currency || ''}`)}</td>
+              <td>{company.focus_areas || '—'}</td>
+              <td>{company.contact_name || company.contact_email || 'Missing'}</td>
+              <td>
+                <div className="row-actions">
+                  {['queued', 'running'].includes(company.research_status) ? (
+                    <span className="muted">Research {company.research_status}</span>
+                  ) : (
+                    <button
+                      disabled={!isReady}
+                      title={!isReady ? 'Confirm official website in company profile or bulk review before researching' : 'Start report discovery'}
+                      onClick={() => onResearch(company)}
+                    >
+                      Research
+                    </button>
+                  )}
+                  <button title="Edit company" onClick={() => onEdit(company)}>Edit</button>
+                  <button title="Delete company" className="danger-text" onClick={() => onDelete(company)}>Delete</button>
+                </div>
+              </td>
+            </tr>
+          );
+        })}</tbody>
       </table>
     </div>
   );
@@ -872,9 +1288,14 @@ function ResearchRuns({ runs, onCompany, onDetails }) {
         <thead><tr><th>Company</th><th>Status</th><th>Progress</th><th>Pages</th><th>Documents</th><th>Findings</th><th>Started</th><th><span className="sr-only">Actions</span></th></tr></thead>
         <tbody>{runs.map((run) => (
           <tr key={run.id}>
-            <td><button className="company-link" onClick={() => onCompany(run)}>{run.company_name}</button><small className="table-subtitle">Run #{run.id}</small></td>
+            <td><button className="company-link" onClick={() => onCompany(run)}>{run.company_name}</button><small className="table-subtitle">Run #{runNumber(run.id)}</small></td>
             <td><Status value={run.status} /></td>
-            <td className="progress-cell">{run.progress_message || '—'}{run.error_summary && <small className="error-detail">{run.error_summary.split('\n')[0]}</small>}{run.warning_summary && <small className="warning-detail">{run.warning_summary.split('\n')[0]}</small>}</td>
+            <td className="progress-cell">
+              {run.progress_message || '—'}
+              {run.status === 'failed' && <small className="error-detail">Stopped: {run.error_summary?.split('\n')[0] || 'Run failed'}</small>}
+              {run.status === 'partially_completed' && <small className="warning-detail">Partial crawl: {run.summary || 'Some documents skipped'}</small>}
+              {run.warning_summary && <small className="warning-detail">{run.warning_summary.split('\n')[0]}</small>}
+            </td>
             <td>{run.pages_visited || 0}</td>
             <td>{run.documents_processed || 0} / {run.documents_discovered || 0}</td>
             <td>{run.findings_count || 0}</td>
@@ -891,29 +1312,62 @@ function ResearchRunDetail({ detail, loading, error, onBack, onCompany }) {
   if (loading) return <div className="loading-card">Loading the saved research report…</div>;
   if (error) return <div className="empty-state"><h2>Could not load this research run</h2><p>{error}</p><button className="button button-outline" onClick={onBack}>Back to run history</button></div>;
   if (!detail?.research_run) return <div className="empty-state"><h2>Research run unavailable</h2><p>The saved run detail response did not include a research run.</p><button className="button button-outline" onClick={onBack}>Back to run history</button></div>;
-  const { research_run: run, company, documents = [], findings = [] } = detail;
+  const { research_run: run, company, documents = [], findings = [], events = [] } = detail;
+  const stopInfo = deriveRunStopInfo(run);
+
   return (
     <section>
       <div className="page-heading no-print">
-        <div><button className="back-link" onClick={onBack}>← All research runs</button><p className="eyebrow">SAVED RUN REPORT · #{run.id}</p><h1>{company?.company_name || `Research run ${run.id}`}</h1><p className="muted">Started {formatDate(run.created_at)} · {documents.length} documents · {findings.length} findings</p></div>
+        <div><button className="back-link" onClick={onBack}>← All research runs</button><p className="eyebrow">SAVED RUN REPORT · #{runNumber(run.id)}</p><h1>{company?.company_name || `Research run ${runNumber(run.id)}`}</h1><p className="muted">Started {formatDate(run.created_at)} · {documents.length} report candidates · {findings.length} existing findings</p></div>
         <div className="page-actions"><button className="button button-outline" onClick={() => downloadRunCsv(detail)}>Export report CSV</button><button className="button button-primary" onClick={() => window.print()}>Print report</button></div>
       </div>
       <article className="info-card print-report">
-        <div className="report-title"><p className="eyebrow">RESEARCH REPORT</p><h1>{company?.company_name || `Research run ${run.id}`}</h1><p className="muted">Run #{run.id} · Started {formatDate(run.created_at)}{run.completed_at ? ` · Completed ${formatDate(run.completed_at)}` : ''}</p></div>
+        <div className="report-title"><p className="eyebrow">RESEARCH REPORT</p><h1>{company?.company_name || `Research run ${runNumber(run.id)}`}</h1><p className="muted">Run #{runNumber(run.id)} · Started {formatDate(run.created_at)}{run.completed_at ? ` · Completed ${formatDate(run.completed_at)}` : ''}</p></div>
         <div className="profile-meta"><Status value={run.status} />{company?.industry && <span>{company.industry}</span>}{company?.official_website && <a className="source-link" href={company.official_website} target="_blank" rel="noreferrer">{company.official_website} ↗</a>}</div>
+        {stopInfo && (
+          <div className={`run-stop-box ${stopInfo.isPartial ? 'partial' : ''}`}>
+            <h3><span>{stopInfo.isPartial ? '⚠️' : '⛔'}</span> Run {stopInfo.isPartial ? 'Partially Completed' : 'Stopped'}</h3>
+            <div className="run-stop-reason"><strong>Specific reason:</strong> {stopInfo.reason}</div>
+            <div className="run-next-step"><strong>Practical next step:</strong> {stopInfo.nextStep}</div>
+          </div>
+        )}
         {run.progress_message && <p className="report-message">{run.progress_message}</p>}
+        {run.summary && <p className="muted">{run.summary}</p>}
         {run.warning_summary && <p className="warning-detail report-notice">Warnings: {run.warning_summary}</p>}
         {run.error_summary && <p className="error-detail report-notice">Errors: {run.error_summary}</p>}
-        <div className="report-stats"><span><strong>{run.pages_visited ?? 0}</strong> pages visited</span><span><strong>{documents.length}</strong> saved documents</span><span><strong>{findings.length}</strong> findings</span></div>
-        <div className="section-heading"><div><p className="eyebrow">SOURCE MATERIAL</p><h2>Documents and pages</h2></div></div>
-        {documents.length ? <div className="report-list">{documents.map((item) => (
-          <article className="report-item" key={item.id}>
-            <div className="finding-top"><strong>{item.title || item.source_url || `Document ${item.id}`}</strong><Status value={item.processing_status || item.status} /></div>
-            {item.source_url && <a className="source-link" href={item.source_url} target="_blank" rel="noreferrer">{item.source_url} ↗</a>}
-            {item.processing_error && <p className="error-detail report-notice">{item.processing_error}</p>}
-            {item.extracted_text && <details><summary>View extracted text</summary><pre className="document-text">{item.extracted_text}</pre></details>}
-          </article>
-        ))}</div> : <p className="muted">No documents were saved for this run.</p>}
+        <div className="report-stats"><span><strong>{run.pages_visited ?? 0}</strong> pages visited</span><span><strong>{run.documents_processed ?? documents.length}</strong> of {run.documents_discovered ?? documents.length} documents processed</span><span><strong>{run.findings_count ?? findings.length}</strong> candidate findings</span></div>
+        <div className="section-heading"><div><p className="eyebrow">RESEARCH ACTIVITY</p><h2>{['queued', 'running'].includes(run.status) ? 'Research is running' : 'Research timeline'}</h2></div>{['queued', 'running'].includes(run.status) && <span className="live-indicator">Live · refreshes automatically</span>}</div>
+        {events.length ? <ol className="report-list activity-list">{events.slice().reverse().map((event) => <li className="report-item activity-item" key={event.id}><div className="finding-top"><strong>{event.message}</strong><span className="muted">{formatTimestamp(event.created_at)}</span></div>{event.source_url && <a className="source-link" href={event.source_url} target="_blank" rel="noreferrer">{event.source_url}</a>}</li>)}</ol> : <p className="muted">Activity will appear as the crawler visits pages and processes documents.</p>}
+        <div className="section-heading"><div><p className="eyebrow">DISCOVERED DOCUMENTS</p><h2>Report candidates & evidence</h2></div></div>
+        {documents.length ? <div className="report-list">{documents.map((item) => {
+          const isChecking = ['discovered', 'processing'].includes(item.processing_status);
+          const isValid = item.processing_status === 'processed' && (item.validation_result === 'valid_pdf' || !item.validation_result);
+          const isSkipped = item.processing_status === 'skipped';
+          const isFailed = item.processing_status === 'failed';
+          const title = item.title && item.title.trim() && item.title !== item.source_url ? item.title : 'Untitled report';
+          return (
+            <article className="report-item" key={item.id}>
+              <div className="finding-top">
+                <strong>{title}</strong>
+                {isChecking && <Status value="checking" label="Checking candidate file" />}
+                {isValid && <Status value="valid_pdf" label="Valid PDF report" />}
+                {isSkipped && <Status value="skipped" label={`Skipped (${item.validation_result || item.processing_error || 'unsupported'})`} />}
+                {isFailed && <Status value="failed" label={`Failed (${item.processing_error || 'error'})`} />}
+              </div>
+              {item.link_text && (
+                <div className="link-evidence">
+                  <span className="evidence-tag">Link text evidence:</span> "{item.link_text}"
+                </div>
+              )}
+              <p className="muted">File type: {item.file_type || 'unknown'} · {item.validation_result || 'Validation pending'}</p>
+              {item.download_available && <a className="button button-outline button-small" href={`/api/documents/${item.id}/download`} download>Download validated report</a>}
+              {item.source_page_url && <a className="source-link" href={item.source_page_url} target="_blank" rel="noreferrer">Source page: {item.source_page_url} ↗</a>}
+              {item.source_url && <span className="source-link">Source URL: {item.source_url}</span>}
+              {item.processing_error && <p className="error-detail report-notice">{item.processing_error}</p>}
+              {item.extracted_text && <details><summary>View extracted text</summary><pre className="document-text">{item.extracted_text}</pre></details>}
+            </article>
+          );
+        })}</div> : <p className="muted">No documents were saved for this run.</p>}
         <div className="section-heading"><div><p className="eyebrow">HUMAN REVIEW</p><h2>Findings and evidence</h2></div></div>
         {findings.length ? <div className="report-list">{findings.map((finding) => (
           <article className="report-item" key={finding.id}>
@@ -952,28 +1406,78 @@ function CompanyProfile({
   markingUnavailable,
 }) {
   if (!profile) return <div className="loading-card">Loading company profile…</div>;
-  const { company, research_runs: runs, documents, findings } = profile;
+  const { company, research_runs: runs, documents, findings, source_values: sourceValues = [] } = profile;
+  const isReady = company.website_readiness === 'ready_to_research' || (Boolean(company.official_website) && Boolean(company.official_website_verified_at));
   return (
     <section>
       <button className="back-link" onClick={onBack}>← Company directory</button>
       <div className="profile-heading">
-        <div><p className="eyebrow">COMPANY PROFILE</p><h1>{company.company_name}</h1><div className="profile-meta"><Status value={company.research_status} />{company.industry && <span>{company.industry}</span>}{company.city && <span>{company.city}</span>}{company.cin && <span>CIN {company.cin}</span>}<span>Last researched {formatDate(company.last_researched_at)}</span></div></div>
-        <div className="profile-actions"><button className="button button-outline" onClick={onEdit}>Edit details</button><button className="button button-primary" disabled={!company.official_website} onClick={onResearch}>Start research</button><button className="button button-quiet-danger" onClick={onDelete}>Delete</button></div>
+        <div>
+          <p className="eyebrow">COMPANY PROFILE</p>
+          <h1>{company.company_name}</h1>
+          <div className="profile-meta">
+            <Status value={company.research_status} />
+            {isReady ? (
+              <span className="readiness-badge readiness-ready">Ready to research</span>
+            ) : company.website_candidate || (company.notes && company.notes.includes('MANUAL_REVIEW')) ? (
+              <span className="readiness-badge readiness-review">Needs manual review</span>
+            ) : (
+              <span className="readiness-badge readiness-waiting">Waiting for website</span>
+            )}
+            {company.industry && <span>{company.industry}</span>}
+            {company.city && <span>{company.city}</span>}
+            {company.cin && <span>CIN {company.cin}</span>}
+            <span>Last researched {formatDate(company.last_researched_at)}</span>
+          </div>
+        </div>
+        <div className="profile-actions">
+          <button className="button button-outline" onClick={onEdit}>Edit details</button>
+          {['queued', 'running'].includes(company.research_status) ? (
+            <span className="muted">Research {company.research_status}</span>
+          ) : (
+            <button className="button button-outline" disabled={!isReady} title={!isReady ? 'Confirm official website in profile before starting research' : 'Start report discovery'} onClick={onResearch}>
+              Start research
+            </button>
+          )}
+          <button className="button button-quiet-danger" onClick={onDelete}>Delete</button>
+        </div>
       </div>
       <div className="profile-grid">
-        <article className="info-card"><p className="eyebrow">OFFICIAL SOURCE</p>{company.official_website ? <><a className="source-link" href={company.official_website} target="_blank" rel="noreferrer">{company.official_website} ↗</a><p className="muted">{company.official_website_verified_at ? `Domain confirmed ${formatDate(company.official_website_verified_at)}` : 'Legacy domain recorded; confirmation date unavailable.'}</p></> : <><p className="muted">No confirmed official website recorded. Add one before starting research.</p>{company.website_candidate && <p className="suggestion-note">Unverified imported candidate: {company.website_candidate}</p>}</>}<p className="notes">{company.notes || 'No researcher notes.'}</p>{(company.contact_name || company.contact_designation || company.contact_email || company.contact_phone) && <div className="contact-details"><p className="eyebrow">CSR CONTACT</p>{company.contact_name && <p>{company.contact_name}{company.contact_designation ? ` · ${company.contact_designation}` : ''}</p>}{company.contact_email && <p>{company.contact_email}</p>}{company.contact_phone && <p>{company.contact_phone}</p>}</div>}</article>
+        <article className="info-card"><p className="eyebrow">OFFICIAL SOURCE</p>{company.official_website ? <><a className="source-link" href={company.official_website} target="_blank" rel="noreferrer">{company.official_website} ↗</a><p className="muted">{company.official_website_verified_at ? `Domain confirmed ${formatDate(company.official_website_verified_at)}` : 'Legacy domain recorded; confirmation date unavailable.'}</p></> : <><p className="muted">No confirmed official website recorded. Add one before starting research.</p>{company.website_candidate && <p className="suggestion-note">Unverified candidate: {company.website_candidate}</p>}</>}<p className="notes">{company.notes || 'No researcher notes.'}</p>{(company.contact_name || company.contact_designation || company.contact_email || company.contact_phone) && <div className="contact-details"><p className="eyebrow">CSR CONTACT</p>{company.contact_name && <p>{company.contact_name}{company.contact_designation ? ` · ${company.contact_designation}` : ''}</p>}{company.contact_email && <p>{company.contact_email}</p>}{company.contact_phone && <p>{company.contact_phone}</p>}</div>}</article>
         <article className="info-card"><p className="eyebrow">RESEARCH SUMMARY</p><div className="mini-stats"><span><strong>{runs.length}</strong> runs</span><span><strong>{documents.length}</strong> sources</span><span><strong>{findings.filter((finding) => finding.review_status === 'pending_review').length}</strong> to review</span></div></article>
       </div>
+      {sourceValues.length > 0 && <><div className="section-heading"><div><p className="eyebrow">IMPORTED SOURCE DATA</p><h2>Workbook values and provenance</h2></div></div><div className="table-wrap"><table><thead><tr><th>Source</th><th>Worksheet</th><th>Source row</th><th>Field</th><th>Original value</th></tr></thead><tbody>{sourceValues.map((item, index) => <tr key={`${item.source_workbook}-${item.source_worksheet}-${item.source_row}-${item.source_column}-${index}`}><td>{item.source_workbook}</td><td>{item.source_worksheet}</td><td>{item.source_row}</td><td>{item.source_column}</td><td>{item.original_value}</td></tr>)}</tbody></table></div></>}
       <div className="section-heading"><div><p className="eyebrow">SOURCE MATERIAL</p><h2>Discovered documents and pages</h2></div></div>
-      {documents.length ? <div className="document-list">{documents.map((item) => (
-        <article className="document-row" key={item.id}>
-          <span className="doc-icon">{item.file_type?.includes('pdf') ? 'PDF' : 'WEB'}</span>
-          <div className="doc-description"><strong>{item.title}</strong><a href={item.source_url} target="_blank" rel="noreferrer">{item.source_url} ↗</a></div>
-          <Status value={item.processing_status || item.status} />
-          {item.processing_error && <span className="error-detail">{item.processing_error}</span>}
-          <button className="button button-outline button-small" onClick={() => onDocument(item.id)}>View text</button>
-        </article>
-      ))}</div> : <div className="empty-state compact-empty"><p>No source documents recorded. Start research to crawl the confirmed website.</p></div>}
+      {documents.length ? <div className="document-list">{documents.map((item) => {
+        const isChecking = ['discovered', 'processing'].includes(item.processing_status);
+        const isValid = item.processing_status === 'processed' && (item.validation_result === 'valid_pdf' || !item.validation_result);
+        const isSkipped = item.processing_status === 'skipped';
+        const isFailed = item.processing_status === 'failed';
+        const title = item.title && item.title.trim() && item.title !== item.source_url ? item.title : 'Untitled report';
+        return (
+          <article className="document-row" key={item.id}>
+            <span className="doc-icon">{item.file_type?.includes('pdf') ? 'PDF' : 'WEB'}</span>
+            <div className="doc-description">
+              <strong>{title}</strong>
+              {item.link_text && (
+                <div className="link-evidence">
+                  <span className="evidence-tag">Link text evidence:</span> "{item.link_text}"
+                </div>
+              )}
+              <span className="source-link">Report URL: {item.source_url}</span>
+            </div>
+            {isChecking && <Status value="checking" label="Checking candidate file" />}
+            {isValid && <Status value="valid_pdf" label="Valid PDF report" />}
+            {isSkipped && <Status value="skipped" label={`Skipped (${item.validation_result || item.processing_error || 'unsupported'})`} />}
+            {isFailed && <Status value="failed" label={`Failed (${item.processing_error || 'error'})`} />}
+            {item.download_available && <a className="button button-outline button-small" href={`/api/documents/${item.id}/download`} download>Download validated report</a>}
+            {item.source_page_url && <a className="source-link" href={item.source_page_url} target="_blank" rel="noreferrer">Source page: {item.source_page_url} ↗</a>}
+            {item.validation_result && <small className="muted">Validation: {item.validation_result}</small>}
+            {item.processing_error && <span className="error-detail">{item.processing_error}</span>}
+            {item.extracted_text && <button className="button button-outline button-small" onClick={() => onDocument(item.id)}>View text</button>}
+          </article>
+        );
+      })}</div> : <div className="empty-state compact-empty"><p>No report candidates have been recorded for this company.</p></div>}
 
       <div className="section-heading"><div><p className="eyebrow">HUMAN REVIEW</p><h2>Extracted findings</h2></div></div>
       <div className="unavailable-form"><span>Record information not found</span><select value={unavailableField} onChange={(event) => setUnavailableField(event.target.value)} aria-label="Field not found"><option value="">Select a CSR field…</option>{unavailableFields.map((field) => <option value={field} key={field}>{field}</option>)}</select><button className="button button-outline button-small" disabled={!unavailableField || markingUnavailable} onClick={onMarkUnavailable}>{markingUnavailable ? 'Saving…' : 'Mark unavailable'}</button></div>
@@ -1002,3 +1506,4 @@ function CompanyProfile({
 }
 
 export default App;
+

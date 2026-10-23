@@ -11,6 +11,13 @@ CREATE TABLE IF NOT EXISTS companies (
   cin VARCHAR(21) NULL,
   industry VARCHAR(160) NULL,
   city VARCHAR(160) NULL,
+  phase VARCHAR(120) NULL,
+  region VARCHAR(160) NULL,
+  headquarters VARCHAR(200) NULL,
+  turnover_amount DECIMAL(20,4) NULL,
+  turnover_currency VARCHAR(12) NULL,
+  turnover_unit VARCHAR(40) NULL,
+  turnover_original VARCHAR(255) NULL,
   official_website VARCHAR(2048) NULL,
   website_candidate VARCHAR(2048) NULL,
   official_website_verified_at DATETIME NULL,
@@ -30,6 +37,9 @@ CREATE TABLE IF NOT EXISTS companies (
   UNIQUE KEY uq_companies_normalized_name (normalized_name),
   KEY idx_companies_cin (cin),
   KEY idx_companies_city (city),
+  KEY idx_companies_phase (phase),
+  KEY idx_companies_region (region),
+  KEY idx_companies_turnover (turnover_currency, turnover_unit, turnover_amount),
   KEY idx_companies_industry (industry),
   KEY idx_companies_research_status (research_status),
   KEY idx_companies_updated_at (updated_at)
@@ -45,6 +55,33 @@ CREATE TABLE IF NOT EXISTS company_aliases (
   UNIQUE KEY uq_company_alias_normalized (normalized_alias),
   KEY idx_company_alias_company (company_id),
   CONSTRAINT fk_company_alias_company FOREIGN KEY (company_id) REFERENCES companies(id) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS company_focus_areas (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  company_id BIGINT UNSIGNED NOT NULL,
+  focus_area VARCHAR(200) NOT NULL,
+  normalized_focus_area VARCHAR(200) NOT NULL,
+  source_value TEXT NULL,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_company_focus_area (company_id, normalized_focus_area),
+  KEY idx_focus_area (normalized_focus_area),
+  CONSTRAINT fk_focus_area_company FOREIGN KEY (company_id) REFERENCES companies(id) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS company_source_values (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  company_id BIGINT UNSIGNED NOT NULL,
+  source_workbook VARCHAR(255) NOT NULL,
+  source_worksheet VARCHAR(255) NOT NULL,
+  source_row INT UNSIGNED NOT NULL,
+  source_column VARCHAR(255) NOT NULL,
+  original_value TEXT NOT NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_company_source_cell (company_id, source_workbook, source_worksheet, source_row, source_column),
+  KEY idx_company_source (company_id, source_workbook),
+  CONSTRAINT fk_company_source_company FOREIGN KEY (company_id) REFERENCES companies(id) ON DELETE CASCADE
 ) ENGINE=InnoDB;
 
 CREATE TABLE IF NOT EXISTS import_batches (
@@ -82,7 +119,7 @@ CREATE TABLE IF NOT EXISTS research_runs (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   company_id BIGINT UNSIGNED NOT NULL,
   status ENUM('queued', 'running', 'completed', 'partially_completed', 'failed') NOT NULL DEFAULT 'queued',
-  progress_message VARCHAR(200) NOT NULL DEFAULT 'Waiting to start',
+  progress_message TEXT NOT NULL,
   pages_visited INT UNSIGNED NOT NULL DEFAULT 0,
   documents_discovered INT UNSIGNED NOT NULL DEFAULT 0,
   documents_processed INT UNSIGNED NOT NULL DEFAULT 0,
@@ -101,11 +138,27 @@ CREATE TABLE IF NOT EXISTS research_runs (
   CONSTRAINT fk_runs_company FOREIGN KEY (company_id) REFERENCES companies(id) ON DELETE CASCADE
 ) ENGINE=InnoDB;
 
+CREATE TABLE IF NOT EXISTS research_run_events (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  research_run_id BIGINT UNSIGNED NOT NULL,
+  event_type VARCHAR(60) NOT NULL,
+  step VARCHAR(40) NOT NULL,
+  message VARCHAR(1000) NOT NULL,
+  source_url VARCHAR(2048) NULL,
+  details JSON NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY idx_run_events_run_created (research_run_id, created_at),
+  CONSTRAINT fk_run_events_run FOREIGN KEY (research_run_id) REFERENCES research_runs(id) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
 CREATE TABLE IF NOT EXISTS documents (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   company_id BIGINT UNSIGNED NOT NULL,
   research_run_id BIGINT UNSIGNED NULL,
   source_url VARCHAR(2048) NOT NULL,
+  source_page_url VARCHAR(2048) NULL,
+  link_text VARCHAR(1000) NULL,
   url_hash CHAR(64) NOT NULL,
   title VARCHAR(500) NOT NULL,
   file_type VARCHAR(120) NOT NULL DEFAULT 'unknown',
@@ -116,9 +169,10 @@ CREATE TABLE IF NOT EXISTS documents (
   content_hash CHAR(64) NULL,
   storage_name VARCHAR(180) NULL,
   extracted_text LONGTEXT NULL,
-  processing_status ENUM('discovered', 'processed', 'empty', 'scanned_or_empty', 'encrypted', 'failed', 'unsupported')
+  processing_status ENUM('discovered', 'processed', 'empty', 'scanned_or_empty', 'encrypted', 'failed', 'unsupported', 'skipped', 'not_processed')
     NOT NULL DEFAULT 'discovered',
   processing_error TEXT NULL,
+  validation_result VARCHAR(1000) NULL,
   downloaded_at DATETIME NULL,
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,

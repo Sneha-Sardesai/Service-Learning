@@ -32,8 +32,9 @@ Implemented functionality:
 - Dashboard metrics and a recent research-run list, sourced from MySQL.
 - Asynchronous research runs with progress, status, counts, errors, and warnings persisted in MySQL.
 - A bounded crawler for a confirmed company website, including robots rules, delays, same-site redirects, DNS/public-address checks, URL de-duplication, and page/size limits.
-- PDF and HTML download and text extraction, with a content cache and statuses for empty/scanned, encrypted, unsupported, or failed documents.
-- Deterministic CSR finding extraction and optional Gemini-based structuring.
+- Official-site PDF report discovery for CSR, BRSR, sustainability, ESG, annual reporting, and community responsibility pages.
+- Report downloads validated from HTTP status, PDF signature, non-empty content, and PDF parsing; candidates retain their source page and skip/failure reason.
+- Research discovery does not extract findings or call Gemini. Discovered reports remain separate from reviewed CSR data.
 - Review actions to edit, approve, reject, or mark a finding/field unavailable.
 - Persisted, paginated research history and run-specific document/finding views.
 - CSV/XLS/XLSX imports with worksheet selection, editable header mapping, validation/duplicate preview, and explicit transactional confirmation into the same company registry.
@@ -382,7 +383,27 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON csr_research.* TO 'csr_app'@'localhost';
 
 If this account already exists, do not blindly rerun `CREATE USER`; use the existing account or update its credential using MySQL’s supported account-management workflow. Put the account values in the root `.env` (`DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`). `database/seed.sql` is intentionally empty of fictitious companies and is not needed for setup.
 
-For an existing installation created with an older `schema.sql`, first make a database backup, then apply `database\migrations\001_research_run_history.sql` through `database\migrations\004_company_contact_details.sql` once each in numeric order, using an administrator account or MySQL Workbench. These additive migrations retain existing records and domains; they do not drop company or research tables. The older schema had overwritten some edited finding values and reassigned deduplicated documents to their most recent run, so values/run associations lost before migration cannot be reconstructed. Do not run these migrations on a database initialized from the current `database/schema.sql`.
+For an existing installation created with an older `schema.sql`, first make a database backup, then apply the migration files in `database\migrations` once each in numeric order (currently `001` through `009`), using an administrator account or MySQL Workbench. Migration 009 adds company location/turnover fields and normalized focus/provenance tables. These additive migrations retain existing records and domains; they do not drop company or research tables. The older schema had overwritten some edited finding values and reassigned deduplicated documents to their most recent run, so values/run associations lost before migration cannot be reconstructed. Do not run these migrations on a database initialized from the current `database/schema.sql`.
+
+### Import the three project workbooks
+
+After the migration is applied and the root `.env` can connect to MySQL, export the workbook cells and run the idempotent importer from the repository root.
+
+**CMD:**
+
+```cmd
+powershell -NoProfile -ExecutionPolicy Bypass -File backend\exportProjectWorkbooks.ps1
+node backend\importProjectWorkbooks.js "%TEMP%\csr_project_workbooks.json"
+```
+
+**PowerShell:**
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\backend\exportProjectWorkbooks.ps1
+node .\backend\importProjectWorkbooks.js "$env:TEMP\csr_project_workbooks.json"
+```
+
+The exporter reads every worksheet, including the Chennai `Notes` sheet, and the importer ignores non-company worksheets. Exact source cell values are retained for provenance. The importer does not call the research engine.
 
 ### 10. Verify configuration and dependencies
 
@@ -434,13 +455,15 @@ All application settings are in the **repository-root `.env`** created from `.en
 | `DB_PASSWORD` | Node MySQL layer | Required for persistent use | Set privately in `.env`; no real value belongs in docs | Password for `DB_USER`. The app checks that the variable is defined; a wrong/blank credential still causes a MySQL connection failure. |
 | `VITE_API_BASE_URL` | Vite frontend | Optional | `/api` | Browser API prefix. Keep relative `/api` for the configured development proxy. |
 | `PYTHON_EXECUTABLE` | Node research bridge | Optional | Empty; uses root `.venv\Scripts\python.exe` if present, otherwise `python` on Windows | Absolute path to Python executable when the default is unsuitable. Example placeholder: `C:\path\to\service-learning-repo\.venv\Scripts\python.exe`. |
-| `MAX_CRAWL_PAGES` | Node bridge / Python engine | Optional | `40`; Python accepts 1–200 | Maximum HTML pages visited. Node forwards the value to Python. |
-| `MAX_CRAWL_DEPTH` | Node bridge / Python engine | Optional | `3`; Python accepts 0–8 | Maximum internal-link depth from the start URL. Node forwards the value to Python. |
-| `RESEARCH_TIMEOUT_MS` | Node research bridge | Optional | `600000` (10 minutes) | Maximum time Node waits for a Python run before killing it. |
+| `MAX_CRAWL_PAGES` | Node bridge / Python engine | Optional | `80`; Python accepts 1–200 | Maximum HTML pages visited. Prioritized sitemap entries and links share this budget. |
+| `MAX_CRAWL_DEPTH` | Node bridge / Python engine | Optional | `4`; Python accepts 0–8 | Maximum internal-link depth from the start URL. |
+| `RESEARCH_TIMEOUT_MS` | Node research bridge | Optional | `1200000` (20 minutes); maximum `2100000` | Hard overall child-process limit; Python's cooperative crawl duration is kept below it for partial results and cleanup. |
 | `CRAWL_TIMEOUT_SECONDS` | Python researcher | Optional | `15`; crawler clamps to 3–60 seconds | Per HTTP request timeout. |
+| `CRAWL_MAX_DURATION_SECONDS` | Node bridge / Python engine | Optional | `900`; Python accepts 10–1800 | Cooperative crawl and report-download duration budget. |
 | `CRAWL_USER_AGENT` | Python researcher/crawler | Optional | `ServiceLearningCSRResearcher/1.0 (educational research)` | User-agent sent to official websites and used for robots rules. |
 | `CRAWL_MIN_DELAY_SECONDS` | Python crawler | Optional | `1`; crawler clamps to 0–10 seconds | Minimum delay between requests; a robots crawl-delay can increase this. |
 | `CRAWL_ALLOWED_SUBDOMAINS` | Python crawler | Optional | Empty | Comma-separated exact subdomain hostnames explicitly approved under the confirmed root domain. Do not add a host without confirming company control. |
+| `CRAWL_ALLOWED_EXTERNAL_HOSTS` | Python crawler | Optional | Empty | Exact third-party report hosts, only after independently verifying their relationship to the company. Other hosts remain blocked and are recorded as candidates. |
 | `MAX_HTML_BYTES` | Python researcher/crawler | Optional | `3000000` (3 MB); crawler clamps to 100 KB–20 MB | Maximum HTML response read per page. |
 | `MAX_DOCUMENT_BYTES` | Python document extractor | Optional | `20971520` (20 MB); extractor clamps to 100 KB–100 MB | Maximum size of one downloaded document. |
 | `MAX_TOTAL_DOCUMENT_BYTES` | Python document extractor | Optional | `62914560` (60 MB); extractor clamps to 100 KB–200 MB | Maximum total downloaded bytes for a run. |
@@ -562,7 +585,7 @@ Keep backend and frontend terminals open while using the web app. Press **Ctrl+C
 
 1. Open the frontend URL, usually `http://localhost:5173`.
 2. Add or select a company. A sample-registry match may suggest a domain, but the suggestion is not saved or used until the researcher confirms it.
-3. Register/confirm the official website, then start research from the company profile or research action. The application prevents a second active run for the same company.
+3. Register/confirm the official website, then start research from the company profile or research action. The application prevents a second active run for the same company. From **Companies**, select up to 25 records and choose **Research selected** to queue a batch. Records without a saved confirmed domain are skipped and listed so you can edit their profile first. The worker starts at most two crawls at once, spaces starts by one second, and keeps each company failure independent. Run history shows each queued run and its eventual status.
 4. Monitor the honest run stage and actual crawl/document counters in the dashboard or persisted **Research history**. Open a run to inspect URLs, document processing outcomes, warnings, and source-linked findings.
 5. Review each finding. Edit its value/year and notes if needed, then approve, reject, or return it to pending review. The original extracted value and supporting source excerpt remain available.
 6. Open the run report to inspect approved, pending, rejected, and unavailable items, then print the report or export findings as CSV.
@@ -590,11 +613,14 @@ All API routes are prefixed with `/api`. Success response shapes below describe 
 | `PATCH /api/companies/:id` | Edit company | JSON company fields | `{ company }` |
 | `DELETE /api/companies/:id` | Delete company and related DB history | Numeric ID | HTTP 204, no body |
 | `POST /api/companies/:id/research` | Queue a research run | Numeric company ID | HTTP 202 `{ research_run: { id, status: "queued" } }` |
+| `POST /api/research/batch` | Queue bounded research for selected companies | `{ company_ids: [..], confirm_official_websites: true }` (up to 25 IDs) | HTTP 202 per-company results and queued/domain-missing/failure counts |
+| `POST /api/companies/:id/research/retry` | Retry a partial or failed run with the saved domain | `{ confirm_official_website: true }` | HTTP 202 queued run ID |
 | `POST /api/research` | Compatibility start endpoint | `{ companyName, website? }` | HTTP 202 with queued run ID |
 | `GET /api/research?page=&limit=` | Persisted paginated research history | Optional page and 1–100 limit | `research_runs`, `pagination` |
-| `GET /api/research/:id` | Retrieve run, company, documents, and findings | Numeric run ID | `{ research_run, company, documents, findings }` |
+| `GET /api/research/:id` | Retrieve run, company, documents, findings, and timestamped progress events | Numeric run ID | `{ research_run, company, documents, findings, events }` |
 | `GET /api/research/:id/documents` | List documents for run | Numeric run ID | `{ documents }` |
 | `GET /api/documents/:id` | Read document record/extracted text | Numeric document ID | `{ document }` |
+| `GET /api/documents/:id/download` | Download the cached source file when available | Numeric document ID | Attachment containing the saved PDF, HTML, or extracted text file |
 | `GET /api/companies/:id/findings` | List company findings | Numeric company ID | `{ findings }` |
 | `POST /api/companies/:id/findings` | Manually mark a field unavailable | `{ field_name }` | HTTP 201 `{ finding }` |
 | `PATCH /api/findings/:id/review` | Edit finding and review state | `review_status`; optional `finding_value`, `financial_year`, `reviewer_notes` | `{ finding }` |
@@ -607,18 +633,16 @@ IDs must be positive safe integers. Research statuses and finding review statuse
 1. **Domain input:** Web research uses the company website explicitly confirmed and stored in the company row.
 2. **Domain registry:** `research/company_domains.json` is a small sample mapping, not a general registry or external discovery system. Exact matches can suggest a URL in the web UI, but the researcher must confirm it.
 3. **Validation:** Node and Python normalize HTTP/HTTPS URLs and reject credentials, IP literal URLs, non-standard ports, and invalid hosts. The crawler checks DNS resolution and rejects non-public addresses.
-4. **Crawling:** `OfficialSiteCrawler` uses a priority queue, follows HTML links up to page/depth limits, and prioritizes CSR/sustainability/ESG/BRSR/annual-report/governance/social-impact terms.
-5. **Scope and politeness:** The confirmed host is allowed by default. Optional explicit subdomains must be subordinate to that host. Redirects are checked before following, robots.txt is consulted, and configured/robots crawl delays and request timeouts apply.
-6. **Document discovery:** PDF links and recognized office-document links are collected. The crawler also returns relevant HTML pages. Office files are recorded as unsupported; they are not executed.
-7. **Download and cache:** Download processing is bounded by per-file, total-run, and document-count limits. A per-company local manifest caches supported PDF/HTML files by URL and content hash for the configured TTL. Relevant HTML pages are stored as text files.
-8. **Text extraction:** `pypdf` extracts selectable text from up to 200 pages per PDF and retains page numbers. BeautifulSoup extracts text from HTML. Encrypted, scanned/empty, unsupported, and failed documents are not represented as successfully extracted text. No OCR is present.
-9. **Local findings:** Regex detects some Indian currency amounts and financial-year formats. Keyword/sentence rules produce CSR-related observations, focus areas, projects, committees, and partner findings. It does not do dedicated table parsing and can miss content.
-10. **Optional Gemini:** If `GEMINI_API_KEY` is configured and `google-genai` is installed, relevant passages may be sent for schema-constrained JSON structuring. The code checks fields, excerpt/value correspondence, source URL, year, and page evidence. Gemini is not required; errors/quota/malformed responses result in a warning while local findings remain.
-11. **Persistence and human review:** Node stores documents/findings with company/run IDs, source URLs, hashes, excerpts, years/pages, and extraction method. Run-link tables preserve run-specific document/finding membership despite cross-run deduplication. New automated findings start as `pending_review`; edits preserve the first extracted value and original excerpt.
+4. **Crawling:** `OfficialSiteCrawler` reads sitemap declarations from `robots.txt`, checks common sitemap paths, parses bounded sitemap indexes, and ranks sitemap and page links using URL paths, anchor text, titles, headings, metadata, and page text. It skips low-value navigation, pagination, tracking-query duplicates, and unapproved hosts while retaining bounded fallback crawling.
+5. **Scope and politeness:** The confirmed host and its exact `www` counterpart are allowed. Optional subdomains must be subordinate to the confirmed domain. Third-party document hosts stay blocked unless explicitly allowlisted after verification. Redirects are checked before following, robots.txt is consulted, and configured/robots crawl delays, request timeouts, page/depth budgets, and a cooperative duration budget apply.
+6. **Report discovery:** PDF links are recorded with their source page. Candidates are ranked by responsibility-related link/page context; unrelated PDFs are explicitly skipped. Other file formats are not accepted as reports in this workflow.
+7. **Download validation:** Downloads are bounded by per-file, total-run, and candidate-count limits. A report is marked saved only after a successful HTTP response, PDF signature check, non-empty write, and parser confirmation. HTML responses, invalid PDFs, and unrelated text are marked failed and cannot be downloaded from the app.
+8. **Progress and persistence:** Queued, running, page-visit, candidate, validation, skip, and completion events are timestamped in MySQL. Candidate records retain direct URL, source page, file type, validation outcome, status, and reason, linked to the company and run.
+9. **Findings remain separate:** This discovery-only workflow does not parse report contents into CSR fields and does not call Gemini or another AI service. Existing findings and review history remain available and unchanged.
 
 ## Spreadsheet imports and data mapping
 
-The import dialog scans actual CSV/XLS/XLSX workbook headers before any database write. Users select a worksheet, edit proposed mappings, inspect validation and duplicate results, and confirm or skip rows. Imports use the canonical `companies` table, retain original row JSON and mappings in `import_batch_rows`, and never promote an imported website candidate to a confirmed domain. CSR values retain financial-year/source context and remain pending review; no source or evidence is fabricated. See [the field-mapping audit](docs/field-mapping.md). The Hinjewadi and Delhi NCR workbook files were not included in this repository, so their exact headers are not preconfigured.
+The import dialog scans actual CSV/XLS/XLSX workbook headers before any database write. Users select a worksheet, edit proposed mappings, inspect validation and duplicate results, and confirm or skip rows. Imports use the canonical `companies` table, retain original row JSON and mappings in `import_batch_rows`, and never promote an imported website candidate to a confirmed domain. CSR values retain financial-year/source context and remain pending review; no source or evidence is fabricated. The three project workbooks and their source-to-database mappings are documented in [the field-mapping audit](docs/field-mapping.md).
 
 The Python JSON mode writes progress events followed by a result object. The Node bridge consumes those lines, ignores unrelated stdout diagnostics rather than confusing them with result JSON, enforces timeout/output limits, and passes the result to the database workflow. This operation depends on the configured Python executable and installed Python requirements.
 
@@ -802,7 +826,7 @@ Gemini is optional. Keep `GEMINI_API_KEY` empty to use local deterministic extra
 
 ### Research finds no pages or documents
 
-The app intentionally does not guess domains or use search engines. Confirm the company’s official URL and that it is stored on the company record. Inspect the run’s `error_summary`/`warning_summary` and document statuses. Robots rules, network failures, redirect boundaries, site structure, subdomain restrictions, or crawl limits can prevent discovery. Add only verified subdomains to `CRAWL_ALLOWED_SUBDOMAINS`; consider carefully adjusting page/depth limits.
+The app intentionally does not guess domains or use search engines. Confirm the company’s official URL and that it is stored on the company record. Inspect the run summary, final timeline event, and document statuses for pages/sitemaps checked, blocked hosts, request errors, and the stop reason. Add only verified subdomains to `CRAWL_ALLOWED_SUBDOMAINS`; add exact external report hosts to `CRAWL_ALLOWED_EXTERNAL_HOSTS` only after confirming the company relationship.
 
 HTML pages are considered relevant using CSR-related terms. PDFs and recognized document links can be discovered; unsupported file types are not processed. A document listing or a crawl result is not proof that its claims are accurate or current.
 
